@@ -1,0 +1,114 @@
+export type SaveStatus = 'idle' | 'local' | 'saving' | 'uploading' | 'saved' | 'paused' | 'error';
+
+export type AssetKind = 'video' | 'audio' | 'image';
+
+export type TimelineItemType = AssetKind | 'text';
+
+export interface DriveProfile {
+  name: string;
+  email: string;
+  picture: string;
+}
+
+export interface DriveFolder {
+  id: string;
+  name: string;
+}
+
+export interface DriveProjectFile {
+  id: string;
+  name: string;
+  modifiedTime?: string;
+  parents?: string[];
+  thumbnailLink?: string;
+}
+
+export interface AssetRecord {
+  id: string;
+  driveFileId?: string;
+  name: string;
+  mimeType: string;
+  kind: AssetKind;
+  size: number;
+  duration?: number;
+  width?: number;
+  height?: number;
+  objectUrl?: string;
+  uploadState: 'local' | 'uploading' | 'uploaded' | 'error';
+  createdAt: string;
+}
+
+export interface TransformRecord {
+  x: number;
+  y: number;
+  scale: number;
+  rotation: number;
+  opacity: number;
+}
+
+export interface TimelineItem {
+  id: string;
+  type: TimelineItemType;
+  trackId: string;
+  assetId?: string;
+  start: number;
+  duration: number;
+  trimStart?: number;
+  trimEnd?: number;
+  text?: string;
+  transform: TransformRecord;
+}
+
+export interface TimelineTrack {
+  id: string;
+  name: string;
+  kind: 'video' | 'audio' | 'text';
+  locked: boolean;
+  muted: boolean;
+}
+
+export interface ProjectRecord {
+  id: string;
+  name: string;
+  folderId?: string;
+  projectFileId?: string;
+  assetsFolderId?: string;
+  rendersFolderId?: string;
+  thumbsFolderId?: string;
+  createdAt: string;
+  updatedAt: string;
+  duration: number;
+  width: number;
+  height: number;
+  fps: number;
+  assets: AssetRecord[];
+  tracks: TimelineTrack[];
+  timeline: TimelineItem[];
+}
+
+export interface StoredState {
+  version: 1;
+  savedAt: string;
+  activeProjectId?: string;
+  projects: ProjectRecord[];
+}
+
+export interface FolderPickerResult {
+  projectName: string;
+  parentId: string;
+}
+
+export interface DriveClient {
+  isConfigured: boolean;
+  accessToken: string;
+  profile: DriveProfile | null;
+  signIn(): Promise<DriveProfile>;
+  signOut(): void;
+  listFolders(parentId?: string): Promise<DriveFolder[]>;
+  createFolder(name: string, parentId?: string, appProperties?: Record<string, string>): Promise<DriveFolder>;
+  listProjects(): Promise<DriveProjectFile[]>;
+  downloadJson<T>(fileId: string): Promise<T>;
+  uploadJson(name: string, data: unknown, parentId: string, appProperties?: Record<string, string>): Promise<DriveProjectFile>;
+  patchJson(fileId: string, data: unknown, appProperties?: Record<string, string>): Promise<DriveProjectFile>;
+  uploadFile(file: File, parentId: string, onProgress?: (progress: number) => void): Promise<DriveProjectFile>;
+}
