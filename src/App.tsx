@@ -44,12 +44,6 @@ const drive = createDriveClient();
 
 type DiffusionCore = typeof import('@diffusionstudio/core');
 
-const demoFolders: DriveFolder[] = [
-  { id: 'root', name: 'Mi unidad' },
-  { id: 'folder_inhouse', name: 'inhouse' },
-  { id: 'folder_social', name: 'social clips' }
-];
-
 function RoofLogo() {
   return (
     <svg viewBox="0 0 40 24" fill="none" aria-hidden="true">
@@ -84,6 +78,8 @@ export function App() {
   const [isFolderPickerOpen, setFolderPickerOpen] = useState(false);
   const [folderPickerMode, setFolderPickerMode] = useState<'project' | 'folder'>('project');
   const [currentFolder, setCurrentFolder] = useState<DriveFolder>({ id: 'root', name: 'Mi unidad' });
+  const [driveFolders, setDriveFolders] = useState<DriveFolder[]>([]);
+  const [foldersLoading, setFoldersLoading] = useState(false);
   const [toast, setToast] = useState('');
   const [isDragging, setDragging] = useState(false);
   const syncTimerRef = useRef<number | null>(null);
@@ -103,12 +99,27 @@ export function App() {
   }, [projects, search]);
 
   const homeFolders = useMemo(() => {
-    const remoteFolders = projects
-      .filter((project) => project.folderId)
-      .slice(0, 6)
-      .map((project) => ({ id: project.folderId!, name: project.name }));
-    return remoteFolders.length ? remoteFolders : demoFolders.slice(1);
-  }, [projects]);
+    const term = search.trim().toLowerCase();
+    if (!term) return driveFolders;
+    return driveFolders.filter((folder) => folder.name.toLowerCase().includes(term));
+  }, [driveFolders, search]);
+
+  const loadDriveFolders = useCallback(async (folderId = currentFolder.id) => {
+    if (!drive.accessToken) {
+      setDriveFolders([]);
+      return;
+    }
+    setFoldersLoading(true);
+    try {
+      const folders = await drive.listFolders(folderId);
+      setDriveFolders(folders);
+    } catch (error) {
+      setDriveFolders([]);
+      setToast(error instanceof Error ? error.message : 'No se pudieron cargar carpetas de Drive.');
+    } finally {
+      setFoldersLoading(false);
+    }
+  }, [currentFolder.id]);
 
   const updateProjects = useCallback((updater: (projects: ProjectRecord[]) => ProjectRecord[]) => {
     setProjects((current) => {
@@ -189,13 +200,19 @@ export function App() {
     };
   }, [activeProject, runDriveSync]);
 
+  useEffect(() => {
+    if (!profile) return;
+    void refreshDriveProjects();
+    void loadDriveFolders(currentFolder.id);
+  }, []);
+
   async function signIn() {
     try {
       setSaveStatus('paused');
       const nextProfile = await drive.signIn();
       setProfile(nextProfile);
       setSaveStatus('saved');
-      await refreshDriveProjects();
+      await Promise.all([refreshDriveProjects(), loadDriveFolders('root')]);
     } catch (error) {
       setSaveStatus('error');
       setToast(error instanceof Error ? error.message : 'No se pudo iniciar sesion.');
@@ -205,6 +222,9 @@ export function App() {
   function signOut() {
     drive.signOut();
     setProfile(null);
+    setActiveProjectId(undefined);
+    setCurrentFolder({ id: 'root', name: 'Mi unidad' });
+    setDriveFolders([]);
     setSaveStatus('local');
   }
 
@@ -446,6 +466,15 @@ export function App() {
     }
   }
 
+  if (!profile) {
+    return (
+      <>
+        <SignInGate saveStatus={saveStatus} onSignIn={signIn} />
+        {toast ? <Toast text={toast} onDone={() => setToast('')} /> : null}
+      </>
+    );
+  }
+
   if (activeProject) {
     return (
       <EditorView
@@ -485,10 +514,14 @@ export function App() {
         search={search}
         saveStatus={saveStatus}
         currentFolder={currentFolder}
+        foldersLoading={foldersLoading}
         onSearch={setSearch}
         onSignIn={signIn}
         onSignOut={signOut}
-        onRefresh={refreshDriveProjects}
+        onRefresh={() => {
+          void refreshDriveProjects();
+          void loadDriveFolders(currentFolder.id);
+        }}
         onCreateProject={() => {
           setFolderPickerMode('project');
           setFolderPickerOpen(true);
@@ -496,7 +529,10 @@ export function App() {
         onOpenProject={setActiveProjectId}
         onDuplicateProject={duplicateProject}
         onDeleteProject={deleteProject}
-        onSelectFolder={(folder) => setCurrentFolder(folder)}
+        onSelectFolder={(folder) => {
+          setCurrentFolder(folder);
+          void loadDriveFolders(folder.id);
+        }}
       />
       <input
         ref={fileInputRef}
@@ -533,6 +569,7 @@ function DriveHome(props: {
   search: string;
   saveStatus: SaveStatus;
   currentFolder: DriveFolder;
+  foldersLoading: boolean;
   onSearch(value: string): void;
   onSignIn(): void;
   onSignOut(): void;
@@ -614,7 +651,9 @@ function DriveHome(props: {
             <div className="drive-section-title">Carpetas</div>
           </div>
           <div className="drive-folder-grid">
-            {props.folders.map((folder) => (
+            {props.foldersLoading ? (
+              <div className="drive-empty drive-grid-empty"><Loader2 className="spin" size={20} /> Cargando carpetas de Drive...</div>
+            ) : props.folders.map((folder) => (
               <button className="drive-folder-card" key={folder.id} onClick={() => props.onSelectFolder(folder)}>
                 <Folder className="drive-folder-icon" />
                 <div className="drive-card-title">{folder.name}</div>
@@ -625,6 +664,9 @@ function DriveHome(props: {
               <div className="drive-card-title">Nuevo proyecto</div>
             </button>
           </div>
+          {!props.foldersLoading && !props.folders.length ? (
+            <div className="drive-empty folder-empty">No hay carpetas en esta ubicacion.</div>
+          ) : null}
         </section>
 
         <section className="drive-section">
@@ -670,6 +712,35 @@ function DriveHome(props: {
         </section>
       </div>
     </>
+  );
+}
+
+function SignInGate(props: {
+  saveStatus: SaveStatus;
+  onSignIn(): void;
+}) {
+  const signingIn = props.saveStatus === 'paused' || props.saveStatus === 'saving';
+
+  return (
+    <main className="signin-gate">
+      <div className="signin-topbar">
+        <div className="drive-brand">
+          <RoofLogo />
+          <span className="brand-name">inhouse vidmaker</span>
+        </div>
+      </div>
+      <section className="signin-panel" aria-label="Sign in">
+        <div className="signin-logo">
+          <RoofLogo />
+        </div>
+        <h1>inhouse vidmaker</h1>
+        <p>Inicia sesion con Google para abrir tus proyectos, carpetas y archivos desde Drive.</p>
+        <button className="google-signin-btn" onClick={props.onSignIn} disabled={signingIn}>
+          {signingIn ? <Loader2 className="spin" size={18} /> : <User size={18} />}
+          <span>{signingIn ? 'Conectando...' : 'Sign in with Google'}</span>
+        </button>
+      </section>
+    </main>
   );
 }
 
@@ -721,7 +792,7 @@ function FolderPicker(props: {
 }) {
   const [name, setName] = useState('nuevo video');
   const [stack, setStack] = useState<DriveFolder[]>([{ id: 'root', name: 'Mi unidad' }]);
-  const [folders, setFolders] = useState<DriveFolder[]>(demoFolders.slice(1));
+  const [folders, setFolders] = useState<DriveFolder[]>([]);
   const [loading, setLoading] = useState(false);
   const active = stack[stack.length - 1];
 
@@ -734,7 +805,7 @@ function FolderPicker(props: {
   useEffect(() => {
     if (!props.open) return;
     if (!props.drive.accessToken) {
-      setFolders(active.id === 'root' ? demoFolders.slice(1) : []);
+      setFolders([]);
       return;
     }
     setLoading(true);
@@ -862,7 +933,10 @@ function EditorView(props: {
       <section className="editor-grid">
         <aside className="asset-panel">
           <div className="panel-head">
-            <h2>Assets</h2>
+            <div>
+              <h2>Assets</h2>
+              <span className="panel-subtitle">{props.project.assets.length} archivos</span>
+            </div>
             <button className="btn btn-secondary btn-icon-square" onClick={props.onPickFiles}><Upload size={17} /></button>
           </div>
           <button className="dropzone" onClick={props.onPickFiles}>
@@ -875,8 +949,9 @@ function EditorView(props: {
                 {asset.kind === 'video' ? <Video size={18} /> : asset.kind === 'audio' ? <Music size={18} /> : <ImageIcon size={18} />}
                 <div>
                   <strong>{asset.name}</strong>
-                  <span>{formatBytes(asset.size)} · {asset.uploadState}</span>
+                  <span>{formatBytes(asset.size)} - {asset.uploadState}</span>
                 </div>
+                <span className={`asset-kind-pill ${asset.kind}`}>{asset.kind}</span>
               </div>
             ))}
             {!props.project.assets.length ? <div className="panel-empty">Sin assets todavia.</div> : null}
@@ -885,6 +960,13 @@ function EditorView(props: {
 
         <section className="preview-panel">
           <div className="preview-canvas">
+            <div className="preview-hud">
+              <div>
+                <strong>{props.project.name}</strong>
+                <span>{props.project.width}x{props.project.height} - {props.project.fps}fps</span>
+              </div>
+              <span>{playhead.toFixed(1)}s</span>
+            </div>
             {activeAsset?.objectUrl && activeAsset.kind === 'video' ? (
               <video src={activeAsset.objectUrl} muted autoPlay={playing} controls={false} />
             ) : activeAsset?.objectUrl && activeAsset.kind === 'image' ? (
@@ -913,16 +995,23 @@ function EditorView(props: {
               value={playhead}
               onChange={(event) => setPlayhead(Number(event.target.value))}
             />
-            <span>{playhead.toFixed(1)}s / {props.project.duration.toFixed(1)}s</span>
+            <span className="transport-time">{playhead.toFixed(1)}s / {props.project.duration.toFixed(1)}s</span>
           </div>
         </section>
 
         <aside className="inspector-panel">
           <div className="panel-head">
-            <h2>Inspector</h2>
+            <div>
+              <h2>Inspector</h2>
+              <span className="panel-subtitle">{selectedClip ? selectedClip.type : 'sin seleccion'}</span>
+            </div>
           </div>
           {selectedClip ? (
             <div className="inspector-fields">
+              <div className="clip-summary">
+                <strong>{selectedClip.type === 'text' ? (selectedClip.text || 'Texto') : selectedClip.type}</strong>
+                <span>{selectedClip.start.toFixed(1)}s - {(selectedClip.start + selectedClip.duration).toFixed(1)}s</span>
+              </div>
               <label>Inicio <input type="number" value={selectedClip.start} min={0} step={0.1} onChange={(event) => props.onUpdateClip(selectedClip.id, { start: Number(event.target.value) })} /></label>
               <label>Duracion <input type="number" value={selectedClip.duration} min={0.2} step={0.1} onChange={(event) => props.onUpdateClip(selectedClip.id, { duration: Number(event.target.value) })} /></label>
               {selectedClip.type === 'text' ? (
@@ -942,8 +1031,11 @@ function EditorView(props: {
 
       <section className="timeline-panel">
         <div className="timeline-toolbar">
-          <button className="btn btn-secondary" onClick={props.onAddText}><Type size={16} /> Texto</button>
-          <button className="btn btn-secondary" onClick={props.onPickFiles}><Upload size={16} /> Importar</button>
+          <div className="timeline-actions">
+            <button className="btn btn-secondary" onClick={props.onAddText}><Type size={16} /> Texto</button>
+            <button className="btn btn-secondary" onClick={props.onPickFiles}><Upload size={16} /> Importar</button>
+          </div>
+          <div className="timeline-meta">{props.project.timeline.length} clips - {props.project.duration.toFixed(1)}s</div>
         </div>
         <div className="timeline-ruler">
           {Array.from({ length: Math.ceil(props.project.duration) + 1 }).map((_, index) => <span key={index}>{index}s</span>)}
