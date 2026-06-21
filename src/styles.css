@@ -1291,6 +1291,11 @@ button {
   background: rgba(224, 122, 60, 0.07);
 }
 
+.asset-row.selected {
+  background: rgba(224, 122, 60, 0.1);
+  box-shadow: inset 3px 0 0 var(--accent-orange);
+}
+
 .asset-row svg {
   color: var(--accent-orange);
 }
@@ -1427,7 +1432,7 @@ button {
 .preview-media-layer img {
   width: 100%;
   height: 100%;
-  object-fit: contain;
+  object-fit: fill;
   display: block;
   pointer-events: none;
   user-select: none;
@@ -1458,19 +1463,29 @@ button {
   padding: 20px;
 }
 
-.preview-text {
+.preview-text-layer {
   position: absolute;
-  left: 50%;
-  bottom: 12%;
-  transform: translateX(-50%);
+  z-index: 50;
+  max-width: 90%;
+  padding: 8px 12px;
   color: #fff;
   font-size: clamp(28px, 4vw, 58px);
   font-weight: 800;
   text-shadow: 0 3px 18px rgba(0, 0, 0, 0.65);
   white-space: nowrap;
-  max-width: 90%;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+
+.preview-text-layer > span {
+  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.preview-text-layer.selected {
+  outline: 2px solid var(--accent-orange);
 }
 
 .transform-field-row {
@@ -1702,6 +1717,16 @@ button {
   overflow: hidden;
 }
 
+.track-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 20;
+  width: 1px;
+  background: var(--accent-orange);
+  pointer-events: none;
+}
+
 .timeline-clip {
   position: absolute;
   top: 7px;
@@ -1716,6 +1741,48 @@ button {
   font-size: 0.76rem;
   font-weight: 700;
   text-align: left;
+  cursor: grab;
+  user-select: none;
+}
+
+.timeline-clip:active {
+  cursor: grabbing;
+}
+
+.timeline-clip > span {
+  display: block;
+  height: 100%;
+  padding: 6px 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+.clip-trim-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 2;
+  width: 7px;
+  padding: 0;
+  border-radius: 0;
+  background: rgba(255, 255, 255, 0.72);
+  opacity: 0;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.clip-trim-handle.start {
+  left: 0;
+}
+
+.clip-trim-handle.end {
+  right: 0;
+}
+
+.timeline-clip:hover .clip-trim-handle,
+.timeline-clip.selected .clip-trim-handle {
+  opacity: 1;
 }
 
 .timeline-clip.video,

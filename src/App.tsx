@@ -79,6 +79,26 @@ function projectCardMeta(project: ProjectRecord) {
   return `${formatWhen(project.updatedAt)} · ${clips} clips · ${assets} assets`;
 }
 
+function readAssetMetadata(kind: AssetRecord['kind'], objectUrl: string): Promise<Pick<AssetRecord, 'duration' | 'width' | 'height'>> {
+  return new Promise((resolve) => {
+    if (kind === 'image') {
+      const image = new Image();
+      image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
+      image.onerror = () => resolve({});
+      image.src = objectUrl;
+      return;
+    }
+    const media = document.createElement(kind === 'video' ? 'video' : 'audio');
+    media.onloadedmetadata = () => resolve({
+      duration: Number.isFinite(media.duration) ? media.duration : undefined,
+      width: kind === 'video' ? (media as HTMLVideoElement).videoWidth : undefined,
+      height: kind === 'video' ? (media as HTMLVideoElement).videoHeight : undefined
+    });
+    media.onerror = () => resolve({});
+    media.src = objectUrl;
+  });
+}
+
 export function App() {
   const initial = useMemo(loadStoredState, []);
   const [projects, setProjects] = useState<ProjectRecord[]>(initial.projects);
@@ -254,7 +274,9 @@ export function App() {
           if (!asset.driveFileId) return asset;
           try {
             const blob = await drive.downloadFile(asset.driveFileId);
-            return { ...asset, objectUrl: URL.createObjectURL(blob), uploadState: 'uploaded' as const };
+            const objectUrl = URL.createObjectURL(blob);
+            const metadata = asset.width || asset.height || asset.duration ? {} : await readAssetMetadata(asset.kind, objectUrl);
+            return { ...asset, ...metadata, objectUrl, uploadState: 'uploaded' as const };
           } catch {
             return { ...asset, uploadState: 'error' as const };
           }
@@ -386,9 +408,9 @@ export function App() {
       setToast('Solo se aceptan video, audio e imagen.');
       return;
     }
-    let insertionStart = activeProject.timeline.reduce((max, clip) => Math.max(max, clip.start + clip.duration), 0);
     for (const file of accepted) {
       const kind = assetKindFromFile(file)!;
+      const objectUrl = URL.createObjectURL(file);
       const asset: AssetRecord = {
         id: uid('asset'),
         folderId: destinationFolderId,
@@ -396,27 +418,20 @@ export function App() {
         mimeType: file.type,
         kind,
         size: file.size,
-        objectUrl: URL.createObjectURL(file),
+        objectUrl,
         uploadState: drive.accessToken && activeProject.assetsFolderId ? 'uploading' : 'local',
         createdAt: nowIso()
       };
-      const item: TimelineItem = {
-        id: uid('clip'),
-        type: kind,
-        trackId: kind === 'audio' ? 'track_audio_1' : 'track_video_1',
-        assetId: asset.id,
-        start: insertionStart,
-        duration: kind === 'image' ? 5 : 6,
-        transform: defaultTransform()
-      };
       patchActiveProject((project) => ({
         ...project,
-        assets: [asset, ...project.assets],
-        timeline: [...project.timeline, item],
-        duration: Math.max(project.duration, item.start + item.duration)
+        assets: [asset, ...project.assets]
       }));
-      insertionStart += item.duration;
-      setFocusedClipId(item.id);
+      void readAssetMetadata(kind, objectUrl).then((metadata) => {
+        patchActiveProject((project) => ({
+          ...project,
+          assets: project.assets.map((entry) => entry.id === asset.id ? { ...entry, ...metadata } : entry)
+        }));
+      });
       const uploadFolderId = destinationFolderId || activeProject.assetsFolderId;
       if (drive.accessToken && uploadFolderId) {
         try {
@@ -441,6 +456,68 @@ export function App() {
         }
       }
     }
+  }
+
+  function placeAssetOnTimeline(assetId: string, start: number, requestedTrackId?: string) {
+    const clipId = uid('clip');
+    patchActiveProject((project) => {
+      const asset = project.assets.find((item) => item.id === assetId && !item.trashedAt);
+      if (!asset) return project;
+      const trackKind = asset.kind === 'audio' ? 'audio' : 'video';
+      const duration = asset.kind === 'image' ? 5 : clamp(asset.duration || 6, 0.2, 60 * 60);
+      const safeStart = clamp(start, 0, Math.max(project.duration, start));
+      let track = project.tracks.find((item) => item.id === requestedTrackId && item.kind === trackKind);
+      const overlaps = (trackId: string) => project.timeline.some((clip) => clip.trackId === trackId && safeStart < clip.start + clip.duration && safeStart + duration > clip.start);
+      if (!track || overlaps(track.id)) track = project.tracks.find((item) => item.kind === trackKind && !overlaps(item.id));
+      let tracks = project.tracks;
+      if (!track) {
+        const count = project.tracks.filter((item) => item.kind === trackKind).length + 1;
+        track = { id: uid(`track_${trackKind}`), name: `${trackKind === 'video' ? 'Video' : 'Audio'} ${count}`, kind: trackKind, locked: false, muted: false };
+        const firstVideo = tracks.findIndex((item) => item.kind === 'video');
+        tracks = trackKind === 'video' && firstVideo >= 0
+          ? [...tracks.slice(0, firstVideo), track, ...tracks.slice(firstVideo)]
+          : [...tracks, track];
+      }
+      const clip: TimelineItem = {
+        id: clipId,
+        type: asset.kind,
+        trackId: track.id,
+        assetId: asset.id,
+        start: safeStart,
+        duration,
+        transform: defaultTransform()
+      };
+      return { ...project, tracks, timeline: [...project.timeline, clip], duration: Math.max(project.duration, safeStart + duration) };
+    });
+    setFocusedClipId(clipId);
+  }
+
+  function moveTimelineClip(clipId: string, start: number, requestedTrackId: string) {
+    patchActiveProject((project) => {
+      const moving = project.timeline.find((clip) => clip.id === clipId);
+      if (!moving) return project;
+      const trackKind = moving.type === 'audio' ? 'audio' : moving.type === 'text' ? 'text' : 'video';
+      const safeStart = Math.max(0, start);
+      let track = project.tracks.find((item) => item.id === requestedTrackId && item.kind === trackKind);
+      const overlaps = (trackId: string) => project.timeline.some((clip) => clip.id !== clipId && clip.trackId === trackId && safeStart < clip.start + clip.duration && safeStart + moving.duration > clip.start);
+      if (!track || overlaps(track.id)) track = project.tracks.find((item) => item.kind === trackKind && !overlaps(item.id));
+      let tracks = project.tracks;
+      if (!track) {
+        const count = project.tracks.filter((item) => item.kind === trackKind).length + 1;
+        track = { id: uid(`track_${trackKind}`), name: `${trackKind === 'text' ? 'Texto' : trackKind === 'video' ? 'Video' : 'Audio'} ${count}`, kind: trackKind, locked: false, muted: false };
+        const firstVideo = tracks.findIndex((item) => item.kind === 'video');
+        tracks = trackKind === 'video' && firstVideo >= 0
+          ? [...tracks.slice(0, firstVideo), track, ...tracks.slice(firstVideo)]
+          : [...tracks, track];
+      }
+      return {
+        ...project,
+        tracks,
+        timeline: project.timeline.map((clip) => clip.id === clipId ? { ...clip, start: safeStart, trackId: track!.id } : clip),
+        duration: Math.max(project.duration, safeStart + moving.duration)
+      };
+    });
+    setFocusedClipId(clipId);
   }
 
   async function createAssetFolder(name: string, parentId?: string) {
@@ -529,10 +606,14 @@ export function App() {
   }
 
   function updateClip(clipId: string, patch: Partial<TimelineItem>) {
-    patchActiveProject((project) => ({
-      ...project,
-      timeline: project.timeline.map((clip) => clip.id === clipId ? { ...clip, ...patch } : clip)
-    }));
+    patchActiveProject((project) => {
+      const timeline = project.timeline.map((clip) => clip.id === clipId ? { ...clip, ...patch } : clip);
+      return {
+        ...project,
+        timeline,
+        duration: Math.max(project.duration, ...timeline.map((clip) => clip.start + clip.duration))
+      };
+    });
   }
 
   function splitClip(clipId: string) {
@@ -624,6 +705,8 @@ export function App() {
         onPickFiles={() => fileInputRef.current?.click()}
         fileInputRef={fileInputRef}
         onAddText={addTextClip}
+        onPlaceAsset={placeAssetOnTimeline}
+        onMoveTimelineClip={moveTimelineClip}
         onCreateAssetFolder={createAssetFolder}
         onMoveAsset={moveAsset}
         onTrashAsset={trashAsset}
@@ -1231,6 +1314,8 @@ function EditorView(props: {
   onDragLeave(): void;
   onPickFiles(): void;
   onAddText(): void;
+  onPlaceAsset(assetId: string, start: number, trackId?: string): void;
+  onMoveTimelineClip(clipId: string, start: number, trackId: string): void;
   onCreateAssetFolder(name: string, parentId?: string): void;
   onMoveAsset(assetId: string, destinationFolderId?: string): void;
   onTrashAsset(assetId: string): void;
@@ -1243,13 +1328,14 @@ function EditorView(props: {
   const [playhead, setPlayhead] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [selectedClipId, setSelectedClipId] = useState<string | undefined>();
+  const [selectedAssetId, setSelectedAssetId] = useState<string | undefined>();
   const [assetFolderId, setAssetFolderId] = useState<string | undefined>();
   const [isCreatingAssetFolder, setCreatingAssetFolder] = useState(false);
   const [assetFolderName, setAssetFolderName] = useState('');
   const [movingAssetId, setMovingAssetId] = useState<string | undefined>();
   const [showAssetBin, setShowAssetBin] = useState(false);
   const previewCanvasRef = useRef<HTMLDivElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const appliedFocusRef = useRef<string | undefined>(undefined);
   const transformGestureRef = useRef<{
     mode: 'move' | 'scale';
@@ -1263,12 +1349,23 @@ function EditorView(props: {
     stageWidth: number;
     stageHeight: number;
   } | null>(null);
+  const trimGestureRef = useRef<{
+    pointerId: number;
+    clipId: string;
+    edge: 'start' | 'end';
+    startX: number;
+    laneWidth: number;
+    originStart: number;
+    originDuration: number;
+    originTrimStart: number;
+  } | null>(null);
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const selectedClip = props.project.timeline.find((clip) => clip.id === selectedClipId);
-  const activeClip = props.project.timeline
-    .filter((clip) => clip.start <= playhead && playhead < clip.start + clip.duration && clip.type !== 'text')
-    .sort((a, b) => (a.type === 'audio' ? 1 : 0) - (b.type === 'audio' ? 1 : 0))[0];
-  const activeAsset = activeClip?.assetId ? props.project.assets.find((asset) => asset.id === activeClip.assetId) : undefined;
+  const activeVisualClips = props.project.timeline
+    .filter((clip) => clip.start <= playhead && playhead < clip.start + clip.duration && (clip.type === 'video' || clip.type === 'image'))
+    .sort((a, b) => props.project.tracks.findIndex((track) => track.id === b.trackId) - props.project.tracks.findIndex((track) => track.id === a.trackId));
+  const activeAudioClip = props.project.timeline.find((clip) => clip.type === 'audio' && clip.start <= playhead && playhead < clip.start + clip.duration);
+  const activeAudioAsset = activeAudioClip?.assetId ? props.project.assets.find((asset) => asset.id === activeAudioClip.assetId) : undefined;
 
   useEffect(() => {
     if (!props.focusedClipId || appliedFocusRef.current === props.focusedClipId) return;
@@ -1281,16 +1378,16 @@ function EditorView(props: {
   }, [props.focusedClipId, props.project.timeline, props.project.duration]);
 
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video || !activeClip || activeAsset?.kind !== 'video') return;
-    const clipTime = Math.max(0, playhead - activeClip.start + (activeClip.trimStart || 0));
-    if (!playing || Math.abs(video.currentTime - clipTime) > 0.25) video.currentTime = clipTime;
-    if (playing) {
-      void video.play().catch(() => setPlaying(false));
-    } else {
-      video.pause();
-    }
-  }, [playhead, playing, activeClip, activeAsset?.kind]);
+    activeVisualClips.forEach((clip) => {
+      if (clip.type !== 'video') return;
+      const video = videoRefs.current.get(clip.id);
+      if (!video) return;
+      const clipTime = Math.max(0, playhead - clip.start + (clip.trimStart || 0));
+      if (!playing || Math.abs(video.currentTime - clipTime) > 0.25) video.currentTime = clipTime;
+      if (playing) void video.play().catch(() => setPlaying(false));
+      else video.pause();
+    });
+  }, [playhead, playing, activeVisualClips]);
 
   const seekFromPointer = (event: ReactPointerEvent<HTMLElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -1300,6 +1397,7 @@ function EditorView(props: {
   };
 
   const beginScrub = (event: ReactPointerEvent<HTMLElement>) => {
+    if ((event.target as HTMLElement).closest('.timeline-clip')) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     seekFromPointer(event);
   };
@@ -1309,11 +1407,56 @@ function EditorView(props: {
   };
 
   const focusAsset = (assetId: string) => {
-    const clip = props.project.timeline.find((item) => item.assetId === assetId);
-    if (!clip) return;
-    setPlaying(false);
-    setSelectedClipId(clip.id);
-    setPlayhead(Math.min(props.project.duration, clip.start + 0.001));
+    setSelectedAssetId(assetId);
+  };
+
+  const dropOnTrack = (event: DragEvent<HTMLElement>, trackId: string) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const start = clamp((event.clientX - bounds.left) / Math.max(1, bounds.width), 0, 1) * props.project.duration;
+    const assetId = event.dataTransfer.getData('application/x-inhouse-asset');
+    const clipId = event.dataTransfer.getData('application/x-inhouse-clip');
+    if (assetId) props.onPlaceAsset(assetId, start, trackId);
+    else if (clipId) props.onMoveTimelineClip(clipId, start, trackId);
+  };
+
+  const beginTrim = (event: ReactPointerEvent<HTMLElement>, clip: TimelineItem, edge: 'start' | 'end') => {
+    event.preventDefault();
+    event.stopPropagation();
+    const lane = event.currentTarget.closest('.track-lane');
+    if (!(lane instanceof HTMLElement)) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    trimGestureRef.current = {
+      pointerId: event.pointerId,
+      clipId: clip.id,
+      edge,
+      startX: event.clientX,
+      laneWidth: Math.max(1, lane.getBoundingClientRect().width),
+      originStart: clip.start,
+      originDuration: clip.duration,
+      originTrimStart: clip.trimStart || 0
+    };
+  };
+
+  const updateTrim = (event: ReactPointerEvent<HTMLElement>) => {
+    const gesture = trimGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    const delta = ((event.clientX - gesture.startX) / gesture.laneWidth) * props.project.duration;
+    if (gesture.edge === 'end') {
+      props.onUpdateClip(gesture.clipId, { duration: Math.max(0.2, gesture.originDuration + delta) });
+      return;
+    }
+    const appliedDelta = clamp(delta, -gesture.originStart, gesture.originDuration - 0.2);
+    props.onUpdateClip(gesture.clipId, {
+      start: gesture.originStart + appliedDelta,
+      duration: gesture.originDuration - appliedDelta,
+      trimStart: Math.max(0, gesture.originTrimStart + appliedDelta)
+    });
+  };
+
+  const endTrim = (event: ReactPointerEvent<HTMLElement>) => {
+    if (trimGestureRef.current?.pointerId === event.pointerId) trimGestureRef.current = null;
   };
 
   const currentAssetFolder = assetFolderId ? props.project.assetFolders.find((folder) => folder.id === assetFolderId) : undefined;
@@ -1340,21 +1483,21 @@ function EditorView(props: {
     return () => observer.disconnect();
   }, [props.project.width, props.project.height]);
 
-  const beginTransform = (event: ReactPointerEvent<HTMLElement>, mode: 'move' | 'scale') => {
-    if (!activeClip || activeClip.type === 'audio') return;
+  const beginTransform = (event: ReactPointerEvent<HTMLElement>, clip: TimelineItem, mode: 'move' | 'scale') => {
+    if (clip.type === 'audio') return;
     event.preventDefault();
     event.stopPropagation();
-    setSelectedClipId(activeClip.id);
+    setSelectedClipId(clip.id);
     event.currentTarget.setPointerCapture(event.pointerId);
     transformGestureRef.current = {
       mode,
       pointerId: event.pointerId,
-      clipId: activeClip.id,
+      clipId: clip.id,
       startX: event.clientX,
       startY: event.clientY,
-      originX: activeClip.transform.x,
-      originY: activeClip.transform.y,
-      originScale: activeClip.transform.scale,
+      originX: clip.transform.x,
+      originY: clip.transform.y,
+      originScale: clip.transform.scale,
       stageWidth: Math.max(1, stageSize.width),
       stageHeight: Math.max(1, stageSize.height)
     };
@@ -1409,7 +1552,13 @@ function EditorView(props: {
         props.onDragLeave();
         if (event.dataTransfer.files.length) props.onFiles(event.dataTransfer.files, assetFolderId);
       }}
-      onDragOver={props.onDragOver}
+      onDragOver={(event) => {
+        if (event.dataTransfer.types.includes('application/x-inhouse-asset') || event.dataTransfer.types.includes('application/x-inhouse-clip')) {
+          event.preventDefault();
+          return;
+        }
+        props.onDragOver(event);
+      }}
       onDragLeave={props.onDragLeave}
     >
       <header className="editor-topbar">
@@ -1468,8 +1617,18 @@ function EditorView(props: {
               </button>
             ))}
             {visibleAssets.map((asset) => (
-              <div className="asset-row" key={asset.id}>
-                <button className="asset-open-button" onClick={() => focusAsset(asset.id)}>
+              <div className={`asset-row ${selectedAssetId === asset.id ? 'selected' : ''}`} key={asset.id}>
+                <button
+                  className="asset-open-button"
+                  draggable={!showAssetBin}
+                  onDragStart={(event) => {
+                    event.dataTransfer.setData('application/x-inhouse-asset', asset.id);
+                    event.dataTransfer.effectAllowed = 'copy';
+                  }}
+                  onClick={() => focusAsset(asset.id)}
+                  onDoubleClick={() => props.onPlaceAsset(asset.id, playhead)}
+                  title="Arrastra a la timeline o haz doble clic"
+                >
                   {asset.kind === 'video' ? <Video size={18} /> : asset.kind === 'audio' ? <Music size={18} /> : <ImageIcon size={18} />}
                   <span className="asset-copy"><strong>{asset.name}</strong><span>{formatBytes(asset.size)} - {asset.uploadState}</span></span>
                 </button>
@@ -1512,42 +1671,71 @@ function EditorView(props: {
               onPointerUp={endTransformGesture}
               onPointerCancel={endTransformGesture}
             >
-              {activeAsset?.objectUrl && (activeAsset.kind === 'video' || activeAsset.kind === 'image') && activeClip ? (
-                <div
-                  className={`preview-media-layer ${selectedClipId === activeClip.id ? 'selected' : ''}`}
-                  style={{
-                    left: `${50 + activeClip.transform.x}%`,
-                    top: `${50 + activeClip.transform.y}%`,
-                    transform: `translate(-50%, -50%) scale(${activeClip.transform.scale}) rotate(${activeClip.transform.rotation}deg)`,
-                    opacity: activeClip.transform.opacity / 100
-                  }}
-                  onPointerDown={(event) => beginTransform(event, 'move')}
-                >
-                  {activeAsset.kind === 'video' ? (
-                    <video ref={videoRef} src={activeAsset.objectUrl} muted playsInline controls={false} draggable={false} />
-                  ) : (
-                    <img src={activeAsset.objectUrl} alt="" draggable={false} />
-                  )}
-                  {selectedClipId === activeClip.id ? (
-                    <button
-                      className="transform-handle"
-                      aria-label="Cambiar tamano"
-                      title="Arrastra para cambiar el tamano"
-                      onPointerDown={(event) => beginTransform(event, 'scale')}
-                    />
-                  ) : null}
-                </div>
-              ) : activeAsset?.objectUrl && activeAsset.kind === 'audio' ? (
-                <div className="audio-preview"><Music size={52} /> {activeAsset.name}</div>
-              ) : (
+              {activeVisualClips.map((clip) => {
+                const asset = clip.assetId ? props.project.assets.find((item) => item.id === clip.assetId) : undefined;
+                if (!asset?.objectUrl) return null;
+                const projectRatio = props.project.width / props.project.height;
+                const assetRatio = asset.width && asset.height ? asset.width / asset.height : projectRatio;
+                const mediaWidth = assetRatio >= projectRatio ? 100 : (assetRatio / projectRatio) * 100;
+                const mediaHeight = assetRatio >= projectRatio ? (projectRatio / assetRatio) * 100 : 100;
+                const trackIndex = props.project.tracks.findIndex((track) => track.id === clip.trackId);
+                return (
+                  <div
+                    key={clip.id}
+                    className={`preview-media-layer ${asset.kind} ${selectedClipId === clip.id ? 'selected' : ''}`}
+                    style={{
+                      width: `${mediaWidth}%`,
+                      height: `${mediaHeight}%`,
+                      left: `${50 + clip.transform.x}%`,
+                      top: `${50 + clip.transform.y}%`,
+                      zIndex: props.project.tracks.length - trackIndex,
+                      transform: `translate(-50%, -50%) scale(${clip.transform.scale}) rotate(${clip.transform.rotation}deg)`,
+                      opacity: clip.transform.opacity / 100
+                    }}
+                    onPointerDown={(event) => beginTransform(event, clip, 'move')}
+                  >
+                    {asset.kind === 'video' ? (
+                      <video ref={(node) => { if (node) videoRefs.current.set(clip.id, node); else videoRefs.current.delete(clip.id); }} src={asset.objectUrl} muted playsInline controls={false} draggable={false} />
+                    ) : (
+                      <img src={asset.objectUrl} alt="" draggable={false} />
+                    )}
+                    {selectedClipId === clip.id ? (
+                      <button
+                        className="transform-handle"
+                        aria-label="Cambiar tamano"
+                        title="Arrastra para cambiar el tamano"
+                        onPointerDown={(event) => beginTransform(event, clip, 'scale')}
+                      />
+                    ) : null}
+                  </div>
+                );
+              })}
+              {!activeVisualClips.length && activeAudioAsset?.objectUrl ? (
+                <div className="audio-preview"><Music size={52} /> {activeAudioAsset.name}</div>
+              ) : !activeVisualClips.length ? (
                 <div className="empty-preview">
                   <Film size={54} />
                   <span>Arrastra clips a la linea de tiempo</span>
                 </div>
-              )}
+              ) : null}
               {props.project.timeline
                 .filter((clip) => clip.type === 'text' && clip.start <= playhead && clip.start + clip.duration >= playhead)
-                .map((clip) => <div className="preview-text" key={clip.id}>{clip.text}</div>)}
+                .map((clip) => (
+                  <div
+                    className={`preview-text-layer ${selectedClipId === clip.id ? 'selected' : ''}`}
+                    key={clip.id}
+                    style={{
+                      left: `${50 + clip.transform.x}%`,
+                      top: `${50 + clip.transform.y}%`,
+                      transform: `translate(-50%, -50%) scale(${clip.transform.scale}) rotate(${clip.transform.rotation}deg)`,
+                      opacity: clip.transform.opacity / 100
+                    }}
+                    onPointerDown={(event) => beginTransform(event, clip, 'move')}
+                  >
+                    <span>{clip.text}</span>
+                    {selectedClipId === clip.id ? <button className="transform-handle" aria-label="Cambiar tamano" onPointerDown={(event) => beginTransform(event, clip, 'scale')} /> : null}
+                  </div>
+                ))}
             </div>
           </div>
           <div className="transport">
@@ -1625,22 +1813,39 @@ function EditorView(props: {
           {props.project.tracks.map((track) => (
             <div className="track-row" key={track.id}>
               <div className="track-label">{track.name}</div>
-              <div className="track-lane timeline-scrub-area" onPointerDown={beginScrub} onPointerMove={continueScrub}>
+              <div
+                className="track-lane timeline-scrub-area"
+                onPointerDown={beginScrub}
+                onPointerMove={continueScrub}
+                onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = event.dataTransfer.types.includes('application/x-inhouse-asset') ? 'copy' : 'move'; }}
+                onDrop={(event) => dropOnTrack(event, track.id)}
+              >
                 {props.project.timeline.filter((clip) => clip.trackId === track.id).map((clip) => {
                   const asset = clip.assetId ? props.project.assets.find((item) => item.id === clip.assetId) : undefined;
                   const left = (clip.start / Math.max(1, props.project.duration)) * 100;
                   const width = (clip.duration / Math.max(1, props.project.duration)) * 100;
                   return (
-                    <button
+                    <div
                       key={clip.id}
                       className={`timeline-clip ${clip.type} ${selectedClipId === clip.id ? 'selected' : ''}`}
-                      style={{ left: `${left}%`, width: `${clamp(width, 4, 100)}%` }}
+                      style={{ left: `${left}%`, width: `${width}%` }}
+                      role="button"
+                      tabIndex={0}
+                      draggable
+                      onDragStart={(event) => {
+                        event.stopPropagation();
+                        event.dataTransfer.setData('application/x-inhouse-clip', clip.id);
+                        event.dataTransfer.effectAllowed = 'move';
+                      }}
                       onClick={() => setSelectedClipId(clip.id)}
                     >
-                      {clip.type === 'text' ? (clip.text || 'Texto') : (asset?.name || clip.type)}
-                    </button>
+                      <button className="clip-trim-handle start" aria-label="Ajustar inicio" onPointerDown={(event) => beginTrim(event, clip, 'start')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
+                      <span>{clip.type === 'text' ? (clip.text || 'Texto') : (asset?.name || clip.type)}</span>
+                      <button className="clip-trim-handle end" aria-label="Ajustar final" onPointerDown={(event) => beginTrim(event, clip, 'end')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
+                    </div>
                   );
                 })}
+                <div className="track-playhead" style={{ left: `${(playhead / Math.max(1, props.project.duration)) * 100}%` }} />
               </div>
             </div>
           ))}
