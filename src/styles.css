@@ -1026,7 +1026,7 @@ button {
   position: fixed;
   inset: 0;
   display: grid;
-  grid-template-rows: var(--banner-height) minmax(0, 1fr) 212px;
+  grid-template-rows: var(--banner-height) minmax(0, 1fr) 6px var(--timeline-height, 212px);
   background: var(--bg-primary);
 }
 
@@ -1050,10 +1050,47 @@ button {
 .editor-grid {
   min-height: 0;
   display: grid;
-  grid-template-columns: 268px minmax(360px, 1fr) 286px;
+  grid-template-columns: var(--asset-panel-width, 268px) 6px minmax(280px, 1fr) 6px var(--inspector-panel-width, 286px);
   gap: 0;
   padding: 0;
   border-bottom: 1px solid var(--border-soft);
+}
+
+.panel-resizer {
+  position: relative;
+  z-index: 30;
+  background: var(--border-soft);
+  touch-action: none;
+  user-select: none;
+}
+
+.panel-resizer::after {
+  content: '';
+  position: absolute;
+  background: var(--accent-orange);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.panel-resizer:hover::after,
+.panel-resizer:active::after {
+  opacity: 1;
+}
+
+.panel-resizer.vertical {
+  cursor: col-resize;
+}
+
+.panel-resizer.vertical::after {
+  inset: 0 2px;
+}
+
+.panel-resizer.horizontal {
+  cursor: row-resize;
+}
+
+.panel-resizer.horizontal::after {
+  inset: 2px 0;
 }
 
 .asset-panel,
@@ -1645,6 +1682,14 @@ button {
   border-bottom: 1px solid var(--border-soft);
 }
 
+.timeline-ruler-content,
+.track-lane-content {
+  position: relative;
+  height: 100%;
+  min-width: 1px;
+  will-change: transform;
+}
+
 .timeline-scrub-area {
   cursor: crosshair;
   touch-action: none;
@@ -1829,6 +1874,10 @@ button {
     grid-template-columns: 1fr;
     grid-template-rows: 120px minmax(240px, 1fr) 150px;
     overflow: auto;
+  }
+
+  .panel-resizer {
+    display: none;
   }
 
   .asset-panel,

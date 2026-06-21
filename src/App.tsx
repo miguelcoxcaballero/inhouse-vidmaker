@@ -25,7 +25,7 @@ import {
   User,
   Video
 } from 'lucide-react';
-import { ChangeEvent, DragEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChangeEvent, CSSProperties, DragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createDriveClient } from './drive';
 import { DRIVE_SYNC_DEBOUNCE_MS, PROJECT_APP_PROPERTY, PROJECT_FILE_NAME, PROJECT_FOLDER_PROPERTY } from './constants';
 import { loadStoredState, persistStoredState } from './storage';
@@ -1333,10 +1333,26 @@ function EditorView(props: {
   const [assetFolderName, setAssetFolderName] = useState('');
   const [movingAssetId, setMovingAssetId] = useState<string | undefined>();
   const [showAssetBin, setShowAssetBin] = useState(false);
+  const [assetPanelWidth, setAssetPanelWidth] = useState(268);
+  const [inspectorPanelWidth, setInspectorPanelWidth] = useState(286);
+  const [timelineHeight, setTimelineHeight] = useState(212);
+  const [timelineZoom, setTimelineZoom] = useState(1);
+  const [timelineOffset, setTimelineOffset] = useState(0);
+  const [timelineViewportWidth, setTimelineViewportWidth] = useState(1);
   const previewCanvasRef = useRef<HTMLDivElement>(null);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const appliedFocusRef = useRef<string | undefined>(undefined);
   const tracksRef = useRef<HTMLDivElement>(null);
+  const timelineRulerRef = useRef<HTMLDivElement>(null);
+  const panelResizeRef = useRef<{
+    pointerId: number;
+    type: 'assets' | 'inspector' | 'timeline';
+    startX: number;
+    startY: number;
+    assetWidth: number;
+    inspectorWidth: number;
+    timelineHeight: number;
+  } | null>(null);
   const transformGestureRef = useRef<{
     mode: 'move' | 'scale';
     pointerId: number;
@@ -1354,7 +1370,7 @@ function EditorView(props: {
     clipId: string;
     edge: 'start' | 'end';
     startX: number;
-    laneWidth: number;
+    pixelsPerSecond: number;
     originStart: number;
     originDuration: number;
     originTrimStart: number;
@@ -1367,6 +1383,10 @@ function EditorView(props: {
     .sort((a, b) => props.project.tracks.findIndex((track) => track.id === b.trackId) - props.project.tracks.findIndex((track) => track.id === a.trackId));
   const activeAudioClip = props.project.timeline.find((clip) => clip.type === 'audio' && clip.start <= playhead && playhead < clip.start + clip.duration);
   const activeAudioAsset = activeAudioClip?.assetId ? props.project.assets.find((asset) => asset.id === activeAudioClip.assetId) : undefined;
+  const timelineDisplayDuration = props.project.duration / Math.min(1, timelineZoom);
+  const timelineContentWidth = timelineViewportWidth * Math.max(1, timelineZoom);
+  const timelinePixelsPerSecond = timelineContentWidth / Math.max(1, timelineDisplayDuration);
+  const timelineTickStep = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600].find((step) => step * timelinePixelsPerSecond >= 52) || 3600;
 
   useEffect(() => {
     if (!props.focusedClipId || appliedFocusRef.current === props.focusedClipId) return;
@@ -1392,9 +1412,9 @@ function EditorView(props: {
 
   const seekFromPointer = (event: ReactPointerEvent<HTMLElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect();
-    const ratio = clamp((event.clientX - bounds.left) / Math.max(1, bounds.width), 0, 1);
+    const nextTime = (event.clientX - bounds.left + timelineOffset) / Math.max(0.001, timelinePixelsPerSecond);
     setPlaying(false);
-    setPlayhead(ratio * props.project.duration);
+    setPlayhead(clamp(nextTime, 0, props.project.duration));
   };
 
   const beginScrub = (event: ReactPointerEvent<HTMLElement>) => {
@@ -1415,7 +1435,7 @@ function EditorView(props: {
     event.preventDefault();
     event.stopPropagation();
     const bounds = event.currentTarget.getBoundingClientRect();
-    const start = clamp((event.clientX - bounds.left) / Math.max(1, bounds.width), 0, 1) * props.project.duration;
+    const start = clamp((event.clientX - bounds.left + timelineOffset) / Math.max(0.001, timelinePixelsPerSecond), 0, props.project.duration);
     const assetId = event.dataTransfer.getData('application/x-inhouse-asset');
     const clipId = event.dataTransfer.getData('application/x-inhouse-clip');
     if (assetId) props.onPlaceAsset(assetId, start, trackId);
@@ -1433,7 +1453,7 @@ function EditorView(props: {
       clipId: clip.id,
       edge,
       startX: event.clientX,
-      laneWidth: Math.max(1, lane.getBoundingClientRect().width),
+      pixelsPerSecond: Math.max(0.001, timelinePixelsPerSecond),
       originStart: clip.start,
       originDuration: clip.duration,
       originTrimStart: clip.trimStart || 0
@@ -1443,7 +1463,7 @@ function EditorView(props: {
   const updateTrim = (event: ReactPointerEvent<HTMLElement>) => {
     const gesture = trimGestureRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) return;
-    const delta = ((event.clientX - gesture.startX) / gesture.laneWidth) * props.project.duration;
+    const delta = (event.clientX - gesture.startX) / gesture.pixelsPerSecond;
     if (gesture.edge === 'end') {
       props.onUpdateClip(gesture.clipId, { duration: Math.max(0.2, gesture.originDuration + delta) });
       return;
@@ -1493,6 +1513,72 @@ function EditorView(props: {
     updateScrollbarWidth();
     return () => observer.disconnect();
   }, [props.project.tracks.length]);
+
+  useEffect(() => {
+    const ruler = timelineRulerRef.current;
+    if (!ruler) return;
+    const updateWidth = () => setTimelineViewportWidth(Math.max(1, ruler.clientWidth));
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(ruler);
+    updateWidth();
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const maxOffset = Math.max(0, timelineContentWidth - timelineViewportWidth);
+    setTimelineOffset((current) => clamp(current, 0, maxOffset));
+  }, [timelineContentWidth, timelineViewportWidth]);
+
+  const handleTimelineWheel = (event: ReactWheelEvent<HTMLElement>) => {
+    event.preventDefault();
+    const horizontalGesture = Math.abs(event.deltaX) > Math.abs(event.deltaY) || event.shiftKey;
+    if (horizontalGesture && timelineZoom > 1) {
+      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+      setTimelineOffset((current) => clamp(current + delta, 0, Math.max(0, timelineContentWidth - timelineViewportWidth)));
+      return;
+    }
+    const bounds = timelineRulerRef.current?.getBoundingClientRect();
+    if (!bounds) return;
+    const cursorX = clamp(event.clientX - bounds.left, 0, bounds.width);
+    const timeAtCursor = (timelineOffset + cursorX) / Math.max(0.001, timelinePixelsPerSecond);
+    const nextZoom = clamp(timelineZoom * Math.exp(-event.deltaY * 0.0015), 0.25, 8);
+    const nextContentWidth = timelineViewportWidth * Math.max(1, nextZoom);
+    const nextDisplayDuration = props.project.duration / Math.min(1, nextZoom);
+    const nextPixelsPerSecond = nextContentWidth / Math.max(1, nextDisplayDuration);
+    const nextMaxOffset = Math.max(0, nextContentWidth - timelineViewportWidth);
+    setTimelineZoom(nextZoom);
+    setTimelineOffset(clamp(timeAtCursor * nextPixelsPerSecond - cursorX, 0, nextMaxOffset));
+  };
+
+  const beginPanelResize = (event: ReactPointerEvent<HTMLElement>, type: 'assets' | 'inspector' | 'timeline') => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    panelResizeRef.current = {
+      pointerId: event.pointerId,
+      type,
+      startX: event.clientX,
+      startY: event.clientY,
+      assetWidth: assetPanelWidth,
+      inspectorWidth: inspectorPanelWidth,
+      timelineHeight
+    };
+  };
+
+  const updatePanelResize = (event: ReactPointerEvent<HTMLElement>) => {
+    const gesture = panelResizeRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    const minimumPreviewWidth = 320;
+    const maximumAssetWidth = Math.max(180, Math.min(440, window.innerWidth - inspectorPanelWidth - minimumPreviewWidth - 12));
+    const maximumInspectorWidth = Math.max(220, Math.min(440, window.innerWidth - assetPanelWidth - minimumPreviewWidth - 12));
+    const maximumTimelineHeight = Math.max(220, window.innerHeight - 56 - 220 - 6);
+    if (gesture.type === 'assets') setAssetPanelWidth(clamp(gesture.assetWidth + event.clientX - gesture.startX, 180, maximumAssetWidth));
+    if (gesture.type === 'inspector') setInspectorPanelWidth(clamp(gesture.inspectorWidth - event.clientX + gesture.startX, 220, maximumInspectorWidth));
+    if (gesture.type === 'timeline') setTimelineHeight(clamp(gesture.timelineHeight - event.clientY + gesture.startY, 140, maximumTimelineHeight));
+  };
+
+  const endPanelResize = (event: ReactPointerEvent<HTMLElement>) => {
+    if (panelResizeRef.current?.pointerId === event.pointerId) panelResizeRef.current = null;
+  };
 
   const beginTransform = (event: ReactPointerEvent<HTMLElement>, clip: TimelineItem, mode: 'move' | 'scale') => {
     if (clip.type === 'audio') return;
@@ -1558,6 +1644,11 @@ function EditorView(props: {
   return (
     <main
       className={`editor-shell ${props.isDragging ? 'dragging' : ''}`}
+      style={{
+        '--asset-panel-width': `${assetPanelWidth}px`,
+        '--inspector-panel-width': `${inspectorPanelWidth}px`,
+        '--timeline-height': `${timelineHeight}px`
+      } as CSSProperties}
       onDrop={(event) => {
         event.preventDefault();
         props.onDragLeave();
@@ -1666,6 +1757,18 @@ function EditorView(props: {
           </div>
         </aside>
 
+        <div
+          className="panel-resizer vertical"
+          role="separator"
+          aria-label="Cambiar ancho de assets"
+          aria-orientation="vertical"
+          onDoubleClick={() => setAssetPanelWidth(268)}
+          onPointerDown={(event) => beginPanelResize(event, 'assets')}
+          onPointerMove={updatePanelResize}
+          onPointerUp={endPanelResize}
+          onPointerCancel={endPanelResize}
+        />
+
         <section className="preview-panel">
           <div className="preview-canvas" ref={previewCanvasRef}>
             <div className="preview-hud">
@@ -1765,6 +1868,18 @@ function EditorView(props: {
           </div>
         </section>
 
+        <div
+          className="panel-resizer vertical"
+          role="separator"
+          aria-label="Cambiar ancho del inspector"
+          aria-orientation="vertical"
+          onDoubleClick={() => setInspectorPanelWidth(286)}
+          onPointerDown={(event) => beginPanelResize(event, 'inspector')}
+          onPointerMove={updatePanelResize}
+          onPointerUp={endPanelResize}
+          onPointerCancel={endPanelResize}
+        />
+
         <aside className="inspector-panel">
           <div className="panel-head">
             <div>
@@ -1806,21 +1921,43 @@ function EditorView(props: {
         </aside>
       </section>
 
+      <div
+        className="panel-resizer horizontal"
+        role="separator"
+        aria-label="Cambiar altura de la timeline"
+        aria-orientation="horizontal"
+        onDoubleClick={() => setTimelineHeight(212)}
+        onPointerDown={(event) => beginPanelResize(event, 'timeline')}
+        onPointerMove={updatePanelResize}
+        onPointerUp={endPanelResize}
+        onPointerCancel={endPanelResize}
+      />
+
       <section className="timeline-panel">
         <div className="timeline-toolbar">
           <div className="timeline-actions">
             <button className="btn btn-secondary" onClick={props.onAddText}><Type size={16} /> Texto</button>
             <button className="btn btn-secondary" onClick={props.onPickFiles}><Upload size={16} /> Importar</button>
           </div>
-          <div className="timeline-meta">{props.project.timeline.length} clips - {props.project.duration.toFixed(1)}s</div>
+          <div className="timeline-meta">{props.project.timeline.length} clips - {props.project.duration.toFixed(1)}s - {Math.round(timelineZoom * 100)}%</div>
         </div>
-        <div className="timeline-ruler timeline-scrub-area" style={{ marginRight: timelineScrollbarWidth }} onPointerDown={beginScrub} onPointerMove={continueScrub}>
-          {Array.from({ length: Math.ceil(props.project.duration) + 1 }).map((_, index) => (
-            <span key={index} style={{ left: `${(index / Math.max(1, props.project.duration)) * 100}%` }}>{index}s</span>
-          ))}
-          <div className="playhead" style={{ left: `${(playhead / Math.max(1, props.project.duration)) * 100}%` }} />
+        <div
+          className="timeline-ruler timeline-scrub-area"
+          ref={timelineRulerRef}
+          style={{ marginRight: timelineScrollbarWidth }}
+          onPointerDown={beginScrub}
+          onPointerMove={continueScrub}
+          onWheel={handleTimelineWheel}
+        >
+          <div className="timeline-ruler-content" style={{ width: timelineContentWidth, transform: `translateX(${-timelineOffset}px)` }}>
+            {Array.from({ length: Math.ceil(timelineDisplayDuration / timelineTickStep) + 1 }).map((_, index) => {
+              const tick = index * timelineTickStep;
+              return <span key={tick} style={{ left: `${(tick / Math.max(1, timelineDisplayDuration)) * 100}%` }}>{tick}s</span>;
+            })}
+            <div className="playhead" style={{ left: `${(playhead / Math.max(1, timelineDisplayDuration)) * 100}%` }} />
+          </div>
         </div>
-        <div className="tracks" ref={tracksRef}>
+        <div className="tracks" ref={tracksRef} onWheel={handleTimelineWheel}>
           {props.project.tracks.map((track) => (
             <div className="track-row" key={track.id}>
               <div className="track-label">{track.name}</div>
@@ -1831,32 +1968,34 @@ function EditorView(props: {
                 onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = event.dataTransfer.types.includes('application/x-inhouse-asset') ? 'copy' : 'move'; }}
                 onDrop={(event) => dropOnTrack(event, track.id)}
               >
-                {props.project.timeline.filter((clip) => clip.trackId === track.id).map((clip) => {
-                  const asset = clip.assetId ? props.project.assets.find((item) => item.id === clip.assetId) : undefined;
-                  const left = (clip.start / Math.max(1, props.project.duration)) * 100;
-                  const width = (clip.duration / Math.max(1, props.project.duration)) * 100;
-                  return (
-                    <div
-                      key={clip.id}
-                      className={`timeline-clip ${clip.type} ${selectedClipId === clip.id ? 'selected' : ''}`}
-                      style={{ left: `${left}%`, width: `${width}%` }}
-                      role="button"
-                      tabIndex={0}
-                      draggable
-                      onDragStart={(event) => {
-                        event.stopPropagation();
-                        event.dataTransfer.setData('application/x-inhouse-clip', clip.id);
-                        event.dataTransfer.effectAllowed = 'move';
-                      }}
-                      onClick={() => setSelectedClipId(clip.id)}
-                    >
-                      <button className="clip-trim-handle start" aria-label="Ajustar inicio" onPointerDown={(event) => beginTrim(event, clip, 'start')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
-                      <span>{clip.type === 'text' ? (clip.text || 'Texto') : (asset?.name || clip.type)}</span>
-                      <button className="clip-trim-handle end" aria-label="Ajustar final" onPointerDown={(event) => beginTrim(event, clip, 'end')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
-                    </div>
-                  );
-                })}
-                <div className="track-playhead" style={{ left: `${(playhead / Math.max(1, props.project.duration)) * 100}%` }} />
+                <div className="track-lane-content" style={{ width: timelineContentWidth, transform: `translateX(${-timelineOffset}px)` }}>
+                  {props.project.timeline.filter((clip) => clip.trackId === track.id).map((clip) => {
+                    const asset = clip.assetId ? props.project.assets.find((item) => item.id === clip.assetId) : undefined;
+                    const left = (clip.start / Math.max(1, timelineDisplayDuration)) * 100;
+                    const width = (clip.duration / Math.max(1, timelineDisplayDuration)) * 100;
+                    return (
+                      <div
+                        key={clip.id}
+                        className={`timeline-clip ${clip.type} ${selectedClipId === clip.id ? 'selected' : ''}`}
+                        style={{ left: `${left}%`, width: `${width}%` }}
+                        role="button"
+                        tabIndex={0}
+                        draggable
+                        onDragStart={(event) => {
+                          event.stopPropagation();
+                          event.dataTransfer.setData('application/x-inhouse-clip', clip.id);
+                          event.dataTransfer.effectAllowed = 'move';
+                        }}
+                        onClick={() => setSelectedClipId(clip.id)}
+                      >
+                        <button className="clip-trim-handle start" aria-label="Ajustar inicio" onPointerDown={(event) => beginTrim(event, clip, 'start')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
+                        <span>{clip.type === 'text' ? (clip.text || 'Texto') : (asset?.name || clip.type)}</span>
+                        <button className="clip-trim-handle end" aria-label="Ajustar final" onPointerDown={(event) => beginTrim(event, clip, 'end')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
+                      </div>
+                    );
+                  })}
+                  <div className="track-playhead" style={{ left: `${(playhead / Math.max(1, timelineDisplayDuration)) * 100}%` }} />
+                </div>
               </div>
             </div>
           ))}
