@@ -280,6 +280,29 @@ export function createDriveClient(): DriveClient {
     return response.json() as Promise<T>;
   }
 
+  async function downloadFile(fileId: string): Promise<Blob> {
+    const response = await driveFetch(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`,
+      {},
+      'No se pudo descargar el asset.'
+    );
+    if (!response.ok) await parseDriveResponse(response, 'No se pudo descargar el asset.');
+    return response.blob();
+  }
+
+  async function moveFile(fileId: string, destinationFolderId: string, previousFolderId: string): Promise<void> {
+    const params = new URLSearchParams({
+      addParents: destinationFolderId,
+      removeParents: previousFolderId,
+      fields: 'id,parents'
+    });
+    await driveJson<DriveProjectFile>(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?${params.toString()}`,
+      { method: 'PATCH' },
+      'No se pudo mover el asset.'
+    );
+  }
+
   function buildMultipart(metadata: unknown, content: string, mimeType = 'application/json') {
     const boundary = 'inhouse_vidmaker_' + Math.random().toString(36).slice(2);
     const body = [
@@ -406,6 +429,8 @@ export function createDriveClient(): DriveClient {
     trashFile,
     restoreFile,
     downloadJson,
+    downloadFile,
+    moveFile,
     uploadJson,
     patchJson,
     uploadFile

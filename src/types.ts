@@ -28,6 +28,8 @@ export interface DriveProjectFile {
 export interface AssetRecord {
   id: string;
   driveFileId?: string;
+  folderId?: string;
+  trashedAt?: string;
   name: string;
   mimeType: string;
   kind: AssetKind;
@@ -37,6 +39,13 @@ export interface AssetRecord {
   height?: number;
   objectUrl?: string;
   uploadState: 'local' | 'uploading' | 'uploaded' | 'error';
+  createdAt: string;
+}
+
+export interface AssetFolderRecord {
+  id: string;
+  name: string;
+  parentId?: string;
   createdAt: string;
 }
 
@@ -85,6 +94,7 @@ export interface ProjectRecord {
   height: number;
   fps: number;
   assets: AssetRecord[];
+  assetFolders: AssetFolderRecord[];
   tracks: TimelineTrack[];
   timeline: TimelineItem[];
 }
@@ -114,6 +124,8 @@ export interface DriveClient {
   trashFile(fileId: string): Promise<void>;
   restoreFile(fileId: string): Promise<void>;
   downloadJson<T>(fileId: string): Promise<T>;
+  downloadFile(fileId: string): Promise<Blob>;
+  moveFile(fileId: string, destinationFolderId: string, previousFolderId: string): Promise<void>;
   uploadJson(name: string, data: unknown, parentId: string, appProperties?: Record<string, string>): Promise<DriveProjectFile>;
   patchJson(fileId: string, data: unknown, appProperties?: Record<string, string>): Promise<DriveProjectFile>;
   uploadFile(file: File, parentId: string, onProgress?: (progress: number) => void): Promise<DriveProjectFile>;

@@ -69,6 +69,7 @@ export function createEmptyProject(name: string, parentId?: string): ProjectReco
     height: 1080,
     fps: 30,
     assets: [],
+    assetFolders: [],
     tracks: createDefaultTracks(),
     timeline: []
   };
@@ -87,6 +88,7 @@ export function normalizeLoadedProject(raw: Partial<ProjectRecord>): ProjectReco
     id: raw.id || fallback.id,
     name: sanitizeProjectName(raw.name || fallback.name),
     assets: Array.isArray(raw.assets) ? raw.assets : [],
+    assetFolders: Array.isArray(raw.assetFolders) ? raw.assetFolders : [],
     tracks: Array.isArray(raw.tracks) && raw.tracks.length ? raw.tracks : createDefaultTracks(),
     timeline: Array.isArray(raw.timeline) ? raw.timeline : [],
     duration: Number(raw.duration) || fallback.duration,

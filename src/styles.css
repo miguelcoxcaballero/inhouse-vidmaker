@@ -1104,6 +1104,62 @@ button {
   font-weight: 700;
 }
 
+.asset-panel-actions,
+.asset-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.asset-panel-actions .active {
+  color: var(--accent-orange);
+  background: rgba(224, 122, 60, 0.1);
+}
+
+.asset-breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: -4px 0 10px;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+}
+
+.asset-breadcrumbs button {
+  padding: 3px 0;
+  color: var(--text-secondary);
+  font-weight: 700;
+}
+
+.asset-breadcrumbs span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.asset-inline-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 34px;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.asset-inline-form input {
+  min-width: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  padding: 7px 9px;
+  background: #fff;
+}
+
+.asset-inline-form .btn {
+  min-height: 34px;
+  padding: 0 10px;
+}
+
 .dropzone {
   width: 100%;
   min-height: 44px;
@@ -1128,16 +1184,111 @@ button {
 }
 
 .asset-row {
+  width: 100%;
   min-height: 58px;
   display: grid;
-  grid-template-columns: 26px minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
   align-items: center;
   padding: 10px 0;
   border-bottom: 1px solid var(--border-soft);
+  border-top: 0;
+  border-left: 0;
+  border-right: 0;
   border-radius: 0;
   background: transparent;
   min-width: 0;
+  text-align: left;
+}
+
+.asset-open-button {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  padding: 0;
+  text-align: left;
+}
+
+.asset-copy {
+  min-width: 0;
+}
+
+.asset-row-actions button {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--text-secondary);
+}
+
+.asset-row-actions button:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--text-primary);
+}
+
+.asset-folder-row {
+  width: 100%;
+  min-height: 48px;
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) 18px;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-soft);
+  text-align: left;
+}
+
+.asset-folder-row svg:first-child {
+  color: var(--accent-orange);
+}
+
+.asset-folder-row strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.82rem;
+}
+
+.asset-move-menu {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 2px;
+  max-height: 170px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: #fff;
+}
+
+.asset-move-menu > strong {
+  padding: 3px 6px 5px;
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+}
+
+.asset-move-menu button {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 6px;
+  border-radius: 5px;
+  overflow: hidden;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.asset-move-menu button:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.asset-row:hover,
+.asset-row:focus-visible {
+  background: rgba(224, 122, 60, 0.07);
 }
 
 .asset-row svg {
@@ -1476,12 +1627,20 @@ button {
   border-radius: 0;
   background: transparent;
   overflow: hidden;
-  display: flex;
   border-bottom: 1px solid var(--border-soft);
 }
 
+.timeline-scrub-area {
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+}
+
 .timeline-ruler span {
-  min-width: 72px;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 36px;
   padding: 4px 6px;
   color: var(--text-secondary);
   font-size: 0.72rem;
@@ -1495,6 +1654,19 @@ button {
   width: 2px;
   background: var(--accent-orange);
   z-index: 3;
+  pointer-events: none;
+}
+
+.playhead::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent-orange);
+  transform: translate(-50%, -35%);
 }
 
 .tracks {

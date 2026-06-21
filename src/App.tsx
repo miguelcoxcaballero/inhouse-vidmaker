@@ -4,6 +4,8 @@ import {
   Download,
   Film,
   Folder,
+  FolderInput,
+  FolderPlus,
   Fullscreen,
   Home,
   Image as ImageIcon,
@@ -93,6 +95,7 @@ export function App() {
   const [isBinOpen, setBinOpen] = useState(false);
   const [toast, setToast] = useState('');
   const [isDragging, setDragging] = useState(false);
+  const [focusedClipId, setFocusedClipId] = useState<string | undefined>();
   const syncTimerRef = useRef<number | null>(null);
   const syncPromiseRef = useRef<Promise<void> | null>(null);
   const syncQueuedRef = useRef(false);
@@ -247,7 +250,16 @@ export function App() {
       const files = await drive.listProjects();
       const loaded = await Promise.all(files.map(async (file) => {
         const project = normalizeLoadedProject(await drive.downloadJson<ProjectRecord>(file.id));
-        return { ...project, projectFileId: file.id, trashedAt: undefined, updatedAt: project.updatedAt || file.modifiedTime || nowIso() };
+        const assets = await Promise.all(project.assets.map(async (asset) => {
+          if (!asset.driveFileId) return asset;
+          try {
+            const blob = await drive.downloadFile(asset.driveFileId);
+            return { ...asset, objectUrl: URL.createObjectURL(blob), uploadState: 'uploaded' as const };
+          } catch {
+            return { ...asset, uploadState: 'error' as const };
+          }
+        }));
+        return { ...project, assets, projectFileId: file.id, trashedAt: undefined, updatedAt: project.updatedAt || file.modifiedTime || nowIso() };
       }));
       setProjects((current) => {
         const byId = new Map(current.map((project) => [project.id, project]));
@@ -364,7 +376,7 @@ export function App() {
     }
   }
 
-  async function addFiles(files: FileList | File[]) {
+  async function addFiles(files: FileList | File[], destinationFolderId?: string) {
     if (!activeProject) {
       setToast('Crea o abre un proyecto antes de subir archivos.');
       return;
@@ -374,10 +386,12 @@ export function App() {
       setToast('Solo se aceptan video, audio e imagen.');
       return;
     }
+    let insertionStart = activeProject.timeline.reduce((max, clip) => Math.max(max, clip.start + clip.duration), 0);
     for (const file of accepted) {
       const kind = assetKindFromFile(file)!;
       const asset: AssetRecord = {
         id: uid('asset'),
+        folderId: destinationFolderId,
         name: file.name,
         mimeType: file.type,
         kind,
@@ -391,7 +405,7 @@ export function App() {
         type: kind,
         trackId: kind === 'audio' ? 'track_audio_1' : 'track_video_1',
         assetId: asset.id,
-        start: activeProject.timeline.reduce((max, clip) => Math.max(max, clip.start + clip.duration), 0),
+        start: insertionStart,
         duration: kind === 'image' ? 5 : 6,
         transform: defaultTransform()
       };
@@ -401,10 +415,13 @@ export function App() {
         timeline: [...project.timeline, item],
         duration: Math.max(project.duration, item.start + item.duration)
       }));
-      if (drive.accessToken && activeProject.assetsFolderId) {
+      insertionStart += item.duration;
+      setFocusedClipId(item.id);
+      const uploadFolderId = destinationFolderId || activeProject.assetsFolderId;
+      if (drive.accessToken && uploadFolderId) {
         try {
           setSaveStatus('uploading');
-          const uploaded = await drive.uploadFile(file, activeProject.assetsFolderId);
+          const uploaded = await drive.uploadFile(file, uploadFolderId);
           patchActiveProject((project) => ({
             ...project,
             assets: project.assets.map((entry) => entry.id === asset.id ? {
@@ -426,15 +443,78 @@ export function App() {
     }
   }
 
+  async function createAssetFolder(name: string, parentId?: string) {
+    if (!activeProject?.assetsFolderId) return;
+    const cleanName = name.trim();
+    if (!cleanName) return;
+    try {
+      const folder = await drive.createFolder(cleanName, parentId || activeProject.assetsFolderId);
+      patchActiveProject((project) => ({
+        ...project,
+        assetFolders: [...project.assetFolders, { id: folder.id, name: folder.name, parentId, createdAt: nowIso() }]
+      }));
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'No se pudo crear la carpeta.');
+    }
+  }
+
+  async function moveAsset(assetId: string, destinationFolderId?: string) {
+    if (!activeProject?.assetsFolderId) return;
+    const asset = activeProject.assets.find((item) => item.id === assetId);
+    if (!asset) return;
+    if (asset.folderId === destinationFolderId) return;
+    try {
+      if (asset.driveFileId) {
+        await drive.moveFile(asset.driveFileId, destinationFolderId || activeProject.assetsFolderId, asset.folderId || activeProject.assetsFolderId);
+      }
+      patchActiveProject((project) => ({
+        ...project,
+        assets: project.assets.map((item) => item.id === assetId ? { ...item, folderId: destinationFolderId } : item)
+      }));
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'No se pudo mover el asset.');
+    }
+  }
+
+  async function trashAsset(assetId: string) {
+    const asset = activeProject?.assets.find((item) => item.id === assetId);
+    if (!asset) return;
+    try {
+      if (asset.driveFileId) await drive.trashFile(asset.driveFileId);
+      patchActiveProject((project) => ({
+        ...project,
+        assets: project.assets.map((item) => item.id === assetId ? { ...item, trashedAt: nowIso() } : item),
+        timeline: project.timeline.filter((clip) => clip.assetId !== assetId)
+      }));
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'No se pudo mover el asset a la papelera.');
+    }
+  }
+
+  async function restoreAsset(assetId: string) {
+    const asset = activeProject?.assets.find((item) => item.id === assetId);
+    if (!asset) return;
+    try {
+      if (asset.driveFileId) await drive.restoreFile(asset.driveFileId);
+      patchActiveProject((project) => ({
+        ...project,
+        assets: project.assets.map((item) => item.id === assetId ? { ...item, trashedAt: undefined } : item)
+      }));
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'No se pudo restaurar el asset.');
+    }
+  }
+
   function addTextClip() {
     if (!activeProject) return;
     const start = activeProject.timeline.reduce((max, clip) => Math.max(max, clip.start + clip.duration), 0);
+    const clipId = uid('clip');
     patchActiveProject((project) => ({
       ...project,
       timeline: [
         ...project.timeline,
         {
-          id: uid('clip'),
+          id: clipId,
           type: 'text',
           trackId: 'track_text',
           start,
@@ -445,6 +525,7 @@ export function App() {
       ],
       duration: Math.max(project.duration, start + 4)
     }));
+    setFocusedClipId(clipId);
   }
 
   function updateClip(clipId: string, patch: Partial<TimelineItem>) {
@@ -535,14 +616,18 @@ export function App() {
         profile={profile}
         saveStatus={saveStatus}
         isDragging={isDragging}
+        focusedClipId={focusedClipId}
         onBack={() => setActiveProjectId(undefined)}
         onFiles={addFiles}
-        onDrop={onDrop}
         onDragOver={onDragOver}
         onDragLeave={() => setDragging(false)}
         onPickFiles={() => fileInputRef.current?.click()}
         fileInputRef={fileInputRef}
         onAddText={addTextClip}
+        onCreateAssetFolder={createAssetFolder}
+        onMoveAsset={moveAsset}
+        onTrashAsset={trashAsset}
+        onRestoreAsset={restoreAsset}
         onUpdateClip={updateClip}
         onSplitClip={splitClip}
         onDeleteClip={deleteClip}
@@ -1138,14 +1223,18 @@ function EditorView(props: {
   profile: ReturnType<typeof createDriveClient>['profile'];
   saveStatus: SaveStatus;
   isDragging: boolean;
+  focusedClipId?: string;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   onBack(): void;
-  onFiles(files: FileList | File[]): void;
-  onDrop(event: DragEvent<HTMLElement>): void;
+  onFiles(files: FileList | File[], destinationFolderId?: string): void;
   onDragOver(event: DragEvent<HTMLElement>): void;
   onDragLeave(): void;
   onPickFiles(): void;
   onAddText(): void;
+  onCreateAssetFolder(name: string, parentId?: string): void;
+  onMoveAsset(assetId: string, destinationFolderId?: string): void;
+  onTrashAsset(assetId: string): void;
+  onRestoreAsset(assetId: string): void;
   onUpdateClip(clipId: string, patch: Partial<TimelineItem>): void;
   onSplitClip(clipId: string): void;
   onDeleteClip(clipId: string): void;
@@ -1154,7 +1243,14 @@ function EditorView(props: {
   const [playhead, setPlayhead] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [selectedClipId, setSelectedClipId] = useState<string | undefined>();
+  const [assetFolderId, setAssetFolderId] = useState<string | undefined>();
+  const [isCreatingAssetFolder, setCreatingAssetFolder] = useState(false);
+  const [assetFolderName, setAssetFolderName] = useState('');
+  const [movingAssetId, setMovingAssetId] = useState<string | undefined>();
+  const [showAssetBin, setShowAssetBin] = useState(false);
   const previewCanvasRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const appliedFocusRef = useRef<string | undefined>(undefined);
   const transformGestureRef = useRef<{
     mode: 'move' | 'scale';
     pointerId: number;
@@ -1170,9 +1266,59 @@ function EditorView(props: {
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const selectedClip = props.project.timeline.find((clip) => clip.id === selectedClipId);
   const activeClip = props.project.timeline
-    .filter((clip) => clip.start <= playhead && clip.start + clip.duration >= playhead)
-    .sort((a, b) => (a.type === 'text' ? 1 : 0) - (b.type === 'text' ? 1 : 0))[0];
+    .filter((clip) => clip.start <= playhead && playhead < clip.start + clip.duration && clip.type !== 'text')
+    .sort((a, b) => (a.type === 'audio' ? 1 : 0) - (b.type === 'audio' ? 1 : 0))[0];
   const activeAsset = activeClip?.assetId ? props.project.assets.find((asset) => asset.id === activeClip.assetId) : undefined;
+
+  useEffect(() => {
+    if (!props.focusedClipId || appliedFocusRef.current === props.focusedClipId) return;
+    const clip = props.project.timeline.find((item) => item.id === props.focusedClipId);
+    if (!clip) return;
+    appliedFocusRef.current = props.focusedClipId;
+    setPlaying(false);
+    setSelectedClipId(clip.id);
+    setPlayhead(Math.min(props.project.duration, clip.start + 0.001));
+  }, [props.focusedClipId, props.project.timeline, props.project.duration]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !activeClip || activeAsset?.kind !== 'video') return;
+    const clipTime = Math.max(0, playhead - activeClip.start + (activeClip.trimStart || 0));
+    if (!playing || Math.abs(video.currentTime - clipTime) > 0.25) video.currentTime = clipTime;
+    if (playing) {
+      void video.play().catch(() => setPlaying(false));
+    } else {
+      video.pause();
+    }
+  }, [playhead, playing, activeClip, activeAsset?.kind]);
+
+  const seekFromPointer = (event: ReactPointerEvent<HTMLElement>) => {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const ratio = clamp((event.clientX - bounds.left) / Math.max(1, bounds.width), 0, 1);
+    setPlaying(false);
+    setPlayhead(ratio * props.project.duration);
+  };
+
+  const beginScrub = (event: ReactPointerEvent<HTMLElement>) => {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    seekFromPointer(event);
+  };
+
+  const continueScrub = (event: ReactPointerEvent<HTMLElement>) => {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) seekFromPointer(event);
+  };
+
+  const focusAsset = (assetId: string) => {
+    const clip = props.project.timeline.find((item) => item.assetId === assetId);
+    if (!clip) return;
+    setPlaying(false);
+    setSelectedClipId(clip.id);
+    setPlayhead(Math.min(props.project.duration, clip.start + 0.001));
+  };
+
+  const currentAssetFolder = assetFolderId ? props.project.assetFolders.find((folder) => folder.id === assetFolderId) : undefined;
+  const visibleAssetFolders = showAssetBin ? [] : props.project.assetFolders.filter((folder) => folder.parentId === assetFolderId);
+  const visibleAssets = props.project.assets.filter((asset) => showAssetBin ? !!asset.trashedAt : !asset.trashedAt && asset.folderId === assetFolderId);
 
   useEffect(() => {
     const canvas = previewCanvasRef.current;
@@ -1258,7 +1404,11 @@ function EditorView(props: {
   return (
     <main
       className={`editor-shell ${props.isDragging ? 'dragging' : ''}`}
-      onDrop={props.onDrop}
+      onDrop={(event) => {
+        event.preventDefault();
+        props.onDragLeave();
+        if (event.dataTransfer.files.length) props.onFiles(event.dataTransfer.files, assetFolderId);
+      }}
       onDragOver={props.onDragOver}
       onDragLeave={props.onDragLeave}
     >
@@ -1282,27 +1432,67 @@ function EditorView(props: {
         <aside className="asset-panel">
           <div className="panel-head">
             <div>
-              <h2>Assets</h2>
-              <span className="panel-subtitle">{props.project.assets.length} archivos</span>
+              <h2>{showAssetBin ? 'Papelera' : 'Assets'}</h2>
+              <span className="panel-subtitle">{visibleAssets.length} archivos</span>
             </div>
-            <button className="btn btn-secondary btn-icon-square" onClick={props.onPickFiles}><Upload size={17} /></button>
+            <div className="asset-panel-actions">
+              {!showAssetBin ? <button className="btn btn-secondary btn-icon-square" title="Nueva carpeta" onClick={() => setCreatingAssetFolder(true)}><FolderPlus size={17} /></button> : null}
+              <button className={`btn btn-secondary btn-icon-square ${showAssetBin ? 'active' : ''}`} title={showAssetBin ? 'Volver a assets' : 'Papelera'} onClick={() => { setShowAssetBin((value) => !value); setMovingAssetId(undefined); }}>
+                {showAssetBin ? <ArrowLeft size={17} /> : <Trash2 size={17} />}
+              </button>
+            </div>
           </div>
-          <button className="dropzone" onClick={props.onPickFiles}>
-            <Upload size={22} />
-            <span>Arrastra archivos o haz clic</span>
-          </button>
+          {!showAssetBin ? (
+            <>
+              <div className="asset-breadcrumbs">
+                <button onClick={() => setAssetFolderId(undefined)}>Assets</button>
+                {currentAssetFolder ? <><ChevronRight size={13} /><span>{currentAssetFolder.name}</span></> : null}
+              </div>
+              <button className="dropzone" onClick={props.onPickFiles}>
+                <Upload size={22} />
+                <span>Arrastra archivos o haz clic</span>
+              </button>
+            </>
+          ) : null}
+          {isCreatingAssetFolder && !showAssetBin ? (
+            <form className="asset-inline-form" onSubmit={(event) => { event.preventDefault(); props.onCreateAssetFolder(assetFolderName, assetFolderId); setAssetFolderName(''); setCreatingAssetFolder(false); }}>
+              <input autoFocus value={assetFolderName} placeholder="Nombre de carpeta" onChange={(event) => setAssetFolderName(event.target.value)} />
+              <button className="btn btn-primary" type="submit">Crear</button>
+              <button className="btn btn-secondary btn-icon-square" type="button" onClick={() => setCreatingAssetFolder(false)}>×</button>
+            </form>
+          ) : null}
           <div className="asset-list">
-            {props.project.assets.map((asset) => (
+            {visibleAssetFolders.map((folder) => (
+              <button className="asset-folder-row" key={folder.id} onClick={() => setAssetFolderId(folder.id)}>
+                <Folder size={19} /><strong>{folder.name}</strong><ChevronRight size={16} />
+              </button>
+            ))}
+            {visibleAssets.map((asset) => (
               <div className="asset-row" key={asset.id}>
-                {asset.kind === 'video' ? <Video size={18} /> : asset.kind === 'audio' ? <Music size={18} /> : <ImageIcon size={18} />}
-                <div>
-                  <strong>{asset.name}</strong>
-                  <span>{formatBytes(asset.size)} - {asset.uploadState}</span>
+                <button className="asset-open-button" onClick={() => focusAsset(asset.id)}>
+                  {asset.kind === 'video' ? <Video size={18} /> : asset.kind === 'audio' ? <Music size={18} /> : <ImageIcon size={18} />}
+                  <span className="asset-copy"><strong>{asset.name}</strong><span>{formatBytes(asset.size)} - {asset.uploadState}</span></span>
+                </button>
+                <div className="asset-row-actions">
+                  {showAssetBin ? (
+                    <button title="Restaurar" onClick={() => props.onRestoreAsset(asset.id)}><RotateCcw size={15} /></button>
+                  ) : (
+                    <>
+                      <button title="Mover" onClick={() => setMovingAssetId(movingAssetId === asset.id ? undefined : asset.id)}><FolderInput size={15} /></button>
+                      <button title="Mover a la papelera" onClick={() => props.onTrashAsset(asset.id)}><Trash2 size={15} /></button>
+                    </>
+                  )}
                 </div>
-                <span className={`asset-kind-pill ${asset.kind}`}>{asset.kind}</span>
+                {movingAssetId === asset.id ? (
+                  <div className="asset-move-menu">
+                    <strong>Mover a</strong>
+                    <button onClick={() => { props.onMoveAsset(asset.id, undefined); setMovingAssetId(undefined); }}><Folder size={15} /> Assets</button>
+                    {props.project.assetFolders.map((folder) => <button key={folder.id} onClick={() => { props.onMoveAsset(asset.id, folder.id); setMovingAssetId(undefined); }}><Folder size={15} /> {folder.name}</button>)}
+                  </div>
+                ) : null}
               </div>
             ))}
-            {!props.project.assets.length ? <div className="panel-empty">Sin assets todavia.</div> : null}
+            {!visibleAssets.length && !visibleAssetFolders.length ? <div className="panel-empty">{showAssetBin ? 'La papelera esta vacia.' : 'Esta carpeta esta vacia.'}</div> : null}
           </div>
         </aside>
 
@@ -1334,7 +1524,7 @@ function EditorView(props: {
                   onPointerDown={(event) => beginTransform(event, 'move')}
                 >
                   {activeAsset.kind === 'video' ? (
-                    <video src={activeAsset.objectUrl} muted autoPlay={playing} controls={false} draggable={false} />
+                    <video ref={videoRef} src={activeAsset.objectUrl} muted playsInline controls={false} draggable={false} />
                   ) : (
                     <img src={activeAsset.objectUrl} alt="" draggable={false} />
                   )}
@@ -1425,15 +1615,17 @@ function EditorView(props: {
           </div>
           <div className="timeline-meta">{props.project.timeline.length} clips - {props.project.duration.toFixed(1)}s</div>
         </div>
-        <div className="timeline-ruler">
-          {Array.from({ length: Math.ceil(props.project.duration) + 1 }).map((_, index) => <span key={index}>{index}s</span>)}
+        <div className="timeline-ruler timeline-scrub-area" onPointerDown={beginScrub} onPointerMove={continueScrub}>
+          {Array.from({ length: Math.ceil(props.project.duration) + 1 }).map((_, index) => (
+            <span key={index} style={{ left: `${(index / Math.max(1, props.project.duration)) * 100}%` }}>{index}s</span>
+          ))}
           <div className="playhead" style={{ left: `${(playhead / Math.max(1, props.project.duration)) * 100}%` }} />
         </div>
         <div className="tracks">
           {props.project.tracks.map((track) => (
             <div className="track-row" key={track.id}>
               <div className="track-label">{track.name}</div>
-              <div className="track-lane">
+              <div className="track-lane timeline-scrub-area" onPointerDown={beginScrub} onPointerMove={continueScrub}>
                 {props.project.timeline.filter((clip) => clip.trackId === track.id).map((clip) => {
                   const asset = clip.assetId ? props.project.assets.find((item) => item.id === clip.assetId) : undefined;
                   const left = (clip.start / Math.max(1, props.project.duration)) * 100;
@@ -1462,7 +1654,7 @@ function EditorView(props: {
         multiple
         accept="video/*,audio/*,image/*"
         onChange={(event) => {
-          if (event.target.files) void props.onFiles(event.target.files);
+          if (event.target.files) void props.onFiles(event.target.files, assetFolderId);
           event.target.value = '';
         }}
       />
