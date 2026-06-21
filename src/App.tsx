@@ -1379,6 +1379,7 @@ function EditorView(props: {
   const [timelineViewportWidth, setTimelineViewportWidth] = useState(1);
   const [timelineDragPreview, setTimelineDragPreview] = useState<TimelineDragPreview | null>(null);
   const [trimSnapTime, setTrimSnapTime] = useState<number | undefined>();
+  const [playheadSnapTime, setPlayheadSnapTime] = useState<number | undefined>();
   const [timelineSelectionBox, setTimelineSelectionBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
   const previewCanvasRef = useRef<HTMLDivElement>(null);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
@@ -1403,6 +1404,8 @@ function EditorView(props: {
     grabOffset: number;
   } | null>(null);
   const timelineDragPreviewRef = useRef<TimelineDragPreview | null>(null);
+  const playheadDragRef = useRef<{ pointerId: number; startX: number } | null>(null);
+  const suppressPlayheadClickRef = useRef(false);
   const timelineSelectionRef = useRef<{
     pointerId: number;
     startX: number;
@@ -1445,7 +1448,7 @@ function EditorView(props: {
   const timelineContentWidth = timelineViewportWidth * Math.max(1, timelineZoom);
   const timelinePixelsPerSecond = timelineContentWidth / Math.max(1, timelineDisplayDuration);
   const timelineTickStep = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600].find((step) => step * timelinePixelsPerSecond >= 52) || 3600;
-  const visibleSnapTime = timelineDragPreview?.snapTime ?? trimSnapTime;
+  const visibleSnapTime = timelineDragPreview?.snapTime ?? trimSnapTime ?? playheadSnapTime;
   const selectClip = (clipId: string, additive = false) => {
     if (!additive) {
       setSelectedClipId(clipId);
@@ -1524,6 +1527,44 @@ function EditorView(props: {
 
   const continueScrub = (event: ReactPointerEvent<HTMLElement>) => {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) seekFromPointer(event);
+  };
+
+  const beginPlayheadDrag = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    playheadDragRef.current = { pointerId: event.pointerId, startX: event.clientX };
+    suppressPlayheadClickRef.current = false;
+    setPlaying(false);
+  };
+
+  const updatePlayheadDrag = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const gesture = playheadDragRef.current;
+    const ruler = timelineRulerRef.current;
+    if (!gesture || !ruler || gesture.pointerId !== event.pointerId) return;
+    if (Math.abs(event.clientX - gesture.startX) > 3) suppressPlayheadClickRef.current = true;
+    const bounds = ruler.getBoundingClientRect();
+    let nextOffset = timelineOffset;
+    if (timelineZoom > 1 && event.clientX < bounds.left + 24) nextOffset -= bounds.left + 24 - event.clientX;
+    if (timelineZoom > 1 && event.clientX > bounds.right - 24) nextOffset += event.clientX - (bounds.right - 24);
+    nextOffset = clamp(nextOffset, 0, Math.max(0, timelineContentWidth - timelineViewportWidth));
+    if (nextOffset !== timelineOffset) setTimelineOffset(nextOffset);
+    const localX = clamp(event.clientX - bounds.left, 0, bounds.width);
+    const rawTime = clamp((localX + nextOffset) / Math.max(0.001, timelinePixelsPerSecond), 0, props.project.duration);
+    const threshold = clamp(8 / Math.max(0.001, timelinePixelsPerSecond), 1 / props.project.fps, 1);
+    const candidate = [0, ...props.project.timeline.flatMap((clip) => [clip.start, clip.start + clip.duration])]
+      .map((time) => ({ time, distance: Math.abs(time - rawTime) }))
+      .filter((entry) => entry.distance <= threshold)
+      .sort((a, b) => a.distance - b.distance)[0];
+    const nextTime = candidate?.time ?? Math.round(rawTime * props.project.fps) / props.project.fps;
+    setPlayheadSnapTime(candidate?.time);
+    setPlayhead(clamp(nextTime, 0, props.project.duration));
+  };
+
+  const endPlayheadDrag = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (playheadDragRef.current?.pointerId !== event.pointerId) return;
+    playheadDragRef.current = null;
+    setPlayheadSnapTime(undefined);
   };
 
   const beginTimelineSelection = (event: ReactPointerEvent<HTMLElement>) => {
@@ -2216,13 +2257,19 @@ function EditorView(props: {
             })}
             <div className="playhead" style={{ left: `${(playhead / Math.max(1, timelineDisplayDuration)) * 100}%` }}>
               <button
-                className={`playhead-cut-button ${splittableClipIds.length ? '' : 'disabled'}`}
-                title={selectedClipIds.length ? 'Cortar seleccion (Ctrl+B)' : 'Cortar todas las capas (Ctrl+B)'}
-                aria-label="Cortar en el playhead"
-                aria-disabled={!splittableClipIds.length}
-                onPointerDown={(event) => event.stopPropagation()}
+                className={`playhead-cut-button ${splittableClipIds.length ? '' : 'cut-unavailable'}`}
+                title={selectedClipIds.length ? 'Arrastra para mover; clic para cortar la seleccion' : 'Arrastra para mover; clic para cortar todas las capas'}
+                aria-label="Mover el playhead o cortar"
+                onPointerDown={beginPlayheadDrag}
+                onPointerMove={updatePlayheadDrag}
+                onPointerUp={endPlayheadDrag}
+                onPointerCancel={endPlayheadDrag}
                 onClick={(event) => {
                   event.stopPropagation();
+                  if (suppressPlayheadClickRef.current) {
+                    suppressPlayheadClickRef.current = false;
+                    return;
+                  }
                   if (splittableClipIds.length) props.onSplitAtPlayhead(playhead, selectedClipIds);
                 }}
               >
