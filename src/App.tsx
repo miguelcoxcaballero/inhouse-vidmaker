@@ -1154,11 +1154,91 @@ function EditorView(props: {
   const [playhead, setPlayhead] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [selectedClipId, setSelectedClipId] = useState<string | undefined>();
+  const previewCanvasRef = useRef<HTMLDivElement>(null);
+  const transformGestureRef = useRef<{
+    mode: 'move' | 'scale';
+    pointerId: number;
+    clipId: string;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+    originScale: number;
+    stageWidth: number;
+    stageHeight: number;
+  } | null>(null);
+  const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const selectedClip = props.project.timeline.find((clip) => clip.id === selectedClipId);
   const activeClip = props.project.timeline
     .filter((clip) => clip.start <= playhead && clip.start + clip.duration >= playhead)
     .sort((a, b) => (a.type === 'text' ? 1 : 0) - (b.type === 'text' ? 1 : 0))[0];
   const activeAsset = activeClip?.assetId ? props.project.assets.find((asset) => asset.id === activeClip.assetId) : undefined;
+
+  useEffect(() => {
+    const canvas = previewCanvasRef.current;
+    if (!canvas) return;
+    const updateStageSize = () => {
+      const bounds = canvas.getBoundingClientRect();
+      const ratio = props.project.width / props.project.height;
+      let width = bounds.width;
+      let height = width / ratio;
+      if (height > bounds.height) {
+        height = bounds.height;
+        width = height * ratio;
+      }
+      setStageSize({ width: Math.max(0, width), height: Math.max(0, height) });
+    };
+    const observer = new ResizeObserver(updateStageSize);
+    observer.observe(canvas);
+    updateStageSize();
+    return () => observer.disconnect();
+  }, [props.project.width, props.project.height]);
+
+  const beginTransform = (event: ReactPointerEvent<HTMLElement>, mode: 'move' | 'scale') => {
+    if (!activeClip || activeClip.type === 'audio') return;
+    event.preventDefault();
+    event.stopPropagation();
+    setSelectedClipId(activeClip.id);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    transformGestureRef.current = {
+      mode,
+      pointerId: event.pointerId,
+      clipId: activeClip.id,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: activeClip.transform.x,
+      originY: activeClip.transform.y,
+      originScale: activeClip.transform.scale,
+      stageWidth: Math.max(1, stageSize.width),
+      stageHeight: Math.max(1, stageSize.height)
+    };
+  };
+
+  const updateTransformGesture = (event: ReactPointerEvent<HTMLElement>) => {
+    const gesture = transformGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    if (gesture.mode === 'move') {
+      props.onUpdateClip(gesture.clipId, {
+        transform: {
+          ...(props.project.timeline.find((clip) => clip.id === gesture.clipId)?.transform || defaultTransform()),
+          x: clamp(gesture.originX + ((event.clientX - gesture.startX) / gesture.stageWidth) * 100, -100, 100),
+          y: clamp(gesture.originY + ((event.clientY - gesture.startY) / gesture.stageHeight) * 100, -100, 100)
+        }
+      });
+      return;
+    }
+    const delta = ((event.clientX - gesture.startX) / gesture.stageWidth + (event.clientY - gesture.startY) / gesture.stageHeight) / 2;
+    props.onUpdateClip(gesture.clipId, {
+      transform: {
+        ...(props.project.timeline.find((clip) => clip.id === gesture.clipId)?.transform || defaultTransform()),
+        scale: clamp(gesture.originScale + delta * 3, 0.1, 5)
+      }
+    });
+  };
+
+  const endTransformGesture = (event: ReactPointerEvent<HTMLElement>) => {
+    if (transformGestureRef.current?.pointerId === event.pointerId) transformGestureRef.current = null;
+  };
 
   useEffect(() => {
     if (!playing) return;
@@ -1227,7 +1307,7 @@ function EditorView(props: {
         </aside>
 
         <section className="preview-panel">
-          <div className="preview-canvas">
+          <div className="preview-canvas" ref={previewCanvasRef}>
             <div className="preview-hud">
               <div>
                 <strong>{props.project.name}</strong>
@@ -1235,21 +1315,50 @@ function EditorView(props: {
               </div>
               <span>{playhead.toFixed(1)}s</span>
             </div>
-            {activeAsset?.objectUrl && activeAsset.kind === 'video' ? (
-              <video src={activeAsset.objectUrl} muted autoPlay={playing} controls={false} />
-            ) : activeAsset?.objectUrl && activeAsset.kind === 'image' ? (
-              <img src={activeAsset.objectUrl} alt="" />
-            ) : activeAsset?.objectUrl && activeAsset.kind === 'audio' ? (
-              <div className="audio-preview"><Music size={52} /> {activeAsset.name}</div>
-            ) : (
-              <div className="empty-preview">
-                <Film size={54} />
-                <span>Arrastra clips a la linea de tiempo</span>
-              </div>
-            )}
-            {props.project.timeline
-              .filter((clip) => clip.type === 'text' && clip.start <= playhead && clip.start + clip.duration >= playhead)
-              .map((clip) => <div className="preview-text" key={clip.id}>{clip.text}</div>)}
+            <div
+              className="preview-stage"
+              style={{ width: stageSize.width, height: stageSize.height }}
+              onPointerMove={updateTransformGesture}
+              onPointerUp={endTransformGesture}
+              onPointerCancel={endTransformGesture}
+            >
+              {activeAsset?.objectUrl && (activeAsset.kind === 'video' || activeAsset.kind === 'image') && activeClip ? (
+                <div
+                  className={`preview-media-layer ${selectedClipId === activeClip.id ? 'selected' : ''}`}
+                  style={{
+                    left: `${50 + activeClip.transform.x}%`,
+                    top: `${50 + activeClip.transform.y}%`,
+                    transform: `translate(-50%, -50%) scale(${activeClip.transform.scale}) rotate(${activeClip.transform.rotation}deg)`,
+                    opacity: activeClip.transform.opacity / 100
+                  }}
+                  onPointerDown={(event) => beginTransform(event, 'move')}
+                >
+                  {activeAsset.kind === 'video' ? (
+                    <video src={activeAsset.objectUrl} muted autoPlay={playing} controls={false} draggable={false} />
+                  ) : (
+                    <img src={activeAsset.objectUrl} alt="" draggable={false} />
+                  )}
+                  {selectedClipId === activeClip.id ? (
+                    <button
+                      className="transform-handle"
+                      aria-label="Cambiar tamano"
+                      title="Arrastra para cambiar el tamano"
+                      onPointerDown={(event) => beginTransform(event, 'scale')}
+                    />
+                  ) : null}
+                </div>
+              ) : activeAsset?.objectUrl && activeAsset.kind === 'audio' ? (
+                <div className="audio-preview"><Music size={52} /> {activeAsset.name}</div>
+              ) : (
+                <div className="empty-preview">
+                  <Film size={54} />
+                  <span>Arrastra clips a la linea de tiempo</span>
+                </div>
+              )}
+              {props.project.timeline
+                .filter((clip) => clip.type === 'text' && clip.start <= playhead && clip.start + clip.duration >= playhead)
+                .map((clip) => <div className="preview-text" key={clip.id}>{clip.text}</div>)}
+            </div>
           </div>
           <div className="transport">
             <button className="btn btn-secondary btn-icon-square" onClick={() => setPlaying((value) => !value)}>
@@ -1285,8 +1394,19 @@ function EditorView(props: {
               {selectedClip.type === 'text' ? (
                 <label>Texto <textarea value={selectedClip.text || ''} onChange={(event) => props.onUpdateClip(selectedClip.id, { text: event.target.value })} /></label>
               ) : null}
+              {selectedClip.type !== 'audio' ? (
+                <>
+                  <div className="transform-field-row">
+                    <label>Posicion X <input type="number" value={Math.round(selectedClip.transform.x * 10) / 10} min={-100} max={100} step={1} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, x: clamp(Number(event.target.value), -100, 100) } })} /></label>
+                    <label>Posicion Y <input type="number" value={Math.round(selectedClip.transform.y * 10) / 10} min={-100} max={100} step={1} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, y: clamp(Number(event.target.value), -100, 100) } })} /></label>
+                  </div>
+                  <label>Escala <input type="range" min={10} max={500} value={selectedClip.transform.scale * 100} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, scale: Number(event.target.value) / 100 } })} /><span className="field-value">{Math.round(selectedClip.transform.scale * 100)}%</span></label>
+                  <label>Rotacion <input type="number" min={-180} max={180} step={1} value={selectedClip.transform.rotation} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, rotation: clamp(Number(event.target.value), -180, 180) } })} /></label>
+                </>
+              ) : null}
               <label>Opacidad <input type="range" min={0} max={100} value={selectedClip.transform.opacity} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, opacity: Number(event.target.value) } })} /></label>
               <div className="inspector-actions">
+                {selectedClip.type !== 'audio' ? <button className="btn btn-secondary btn-icon-square" title="Restablecer transformacion" onClick={() => props.onUpdateClip(selectedClip.id, { transform: defaultTransform() })}><RotateCcw size={15} /></button> : null}
                 <button className="btn btn-secondary" onClick={() => props.onSplitClip(selectedClip.id)}><Scissors size={15} /> Dividir</button>
                 <button className="btn btn-secondary danger" onClick={() => props.onDeleteClip(selectedClip.id)}><Trash2 size={15} /> Borrar</button>
               </div>
