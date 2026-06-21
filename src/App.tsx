@@ -1379,6 +1379,7 @@ function EditorView(props: {
   const [timelineViewportWidth, setTimelineViewportWidth] = useState(1);
   const [timelineDragPreview, setTimelineDragPreview] = useState<TimelineDragPreview | null>(null);
   const [trimSnapTime, setTrimSnapTime] = useState<number | undefined>();
+  const [timelineSelectionBox, setTimelineSelectionBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
   const previewCanvasRef = useRef<HTMLDivElement>(null);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const appliedFocusRef = useRef<string | undefined>(undefined);
@@ -1402,6 +1403,14 @@ function EditorView(props: {
     grabOffset: number;
   } | null>(null);
   const timelineDragPreviewRef = useRef<TimelineDragPreview | null>(null);
+  const timelineSelectionRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    tracksLeft: number;
+    tracksTop: number;
+    initialIds: string[];
+  } | null>(null);
   const transformGestureRef = useRef<{
     mode: 'move' | 'scale';
     pointerId: number;
@@ -1515,6 +1524,61 @@ function EditorView(props: {
 
   const continueScrub = (event: ReactPointerEvent<HTMLElement>) => {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) seekFromPointer(event);
+  };
+
+  const beginTimelineSelection = (event: ReactPointerEvent<HTMLElement>) => {
+    if ((event.target as HTMLElement).closest('.timeline-clip')) return;
+    const tracks = tracksRef.current;
+    if (!tracks) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const additive = event.ctrlKey || event.metaKey || event.shiftKey;
+    if (!additive) clearClipSelection();
+    seekFromPointer(event);
+    const bounds = tracks.getBoundingClientRect();
+    timelineSelectionRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      tracksLeft: bounds.left,
+      tracksTop: bounds.top,
+      initialIds: additive ? [...selectedClipIds] : []
+    };
+    setTimelineSelectionBox(null);
+  };
+
+  const updateTimelineSelection = (event: ReactPointerEvent<HTMLElement>) => {
+    const gesture = timelineSelectionRef.current;
+    const tracks = tracksRef.current;
+    if (!gesture || !tracks || gesture.pointerId !== event.pointerId) return;
+    const distance = Math.hypot(event.clientX - gesture.startX, event.clientY - gesture.startY);
+    if (distance < 4) return;
+    const leftClient = Math.min(gesture.startX, event.clientX);
+    const rightClient = Math.max(gesture.startX, event.clientX);
+    const topClient = Math.min(gesture.startY, event.clientY);
+    const bottomClient = Math.max(gesture.startY, event.clientY);
+    const intersectingIds = Array.from(tracks.querySelectorAll<HTMLElement>('[data-clip-id]'))
+      .filter((element) => {
+        const bounds = element.getBoundingClientRect();
+        return bounds.left < rightClient && bounds.right > leftClient && bounds.top < bottomClient && bounds.bottom > topClient;
+      })
+      .map((element) => element.dataset.clipId!)
+      .filter(Boolean);
+    const nextIds = Array.from(new Set([...gesture.initialIds, ...intersectingIds]));
+    setSelectedClipIds(nextIds);
+    setSelectedClipId(nextIds[nextIds.length - 1]);
+    setTimelineSelectionBox({
+      left: leftClient - gesture.tracksLeft,
+      top: topClient - gesture.tracksTop + tracks.scrollTop,
+      width: rightClient - leftClient,
+      height: bottomClient - topClient
+    });
+  };
+
+  const endTimelineSelection = (event: ReactPointerEvent<HTMLElement>) => {
+    if (timelineSelectionRef.current?.pointerId !== event.pointerId) return;
+    timelineSelectionRef.current = null;
+    setTimelineSelectionBox(null);
   };
 
   const focusAsset = (assetId: string) => {
@@ -2133,15 +2197,6 @@ function EditorView(props: {
       <section className="timeline-panel" ref={timelinePanelRef}>
         <div className="timeline-toolbar">
           <div className="timeline-actions">
-            <button
-              className="btn btn-secondary btn-icon-square"
-              title={selectedClipIds.length ? 'Cortar seleccion en el playhead (Ctrl+B)' : 'Cortar todas las capas en el playhead (Ctrl+B)'}
-              aria-label="Cortar en el playhead"
-              disabled={!splittableClipIds.length}
-              onClick={() => props.onSplitAtPlayhead(playhead, selectedClipIds)}
-            >
-              <Scissors size={16} />
-            </button>
             <button className="btn btn-secondary" onClick={props.onAddText}><Type size={16} /> Texto</button>
             <button className="btn btn-secondary" onClick={props.onPickFiles}><Upload size={16} /> Importar</button>
           </div>
@@ -2159,7 +2214,21 @@ function EditorView(props: {
               const tick = index * timelineTickStep;
               return <span key={tick} style={{ left: `${(tick / Math.max(1, timelineDisplayDuration)) * 100}%` }}>{tick}s</span>;
             })}
-            <div className="playhead" style={{ left: `${(playhead / Math.max(1, timelineDisplayDuration)) * 100}%` }} />
+            <div className="playhead" style={{ left: `${(playhead / Math.max(1, timelineDisplayDuration)) * 100}%` }}>
+              <button
+                className={`playhead-cut-button ${splittableClipIds.length ? '' : 'disabled'}`}
+                title={selectedClipIds.length ? 'Cortar seleccion (Ctrl+B)' : 'Cortar todas las capas (Ctrl+B)'}
+                aria-label="Cortar en el playhead"
+                aria-disabled={!splittableClipIds.length}
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  if (splittableClipIds.length) props.onSplitAtPlayhead(playhead, selectedClipIds);
+                }}
+              >
+                <Scissors size={12} />
+              </button>
+            </div>
             {visibleSnapTime !== undefined ? <div className="timeline-snap-guide ruler" style={{ left: `${(visibleSnapTime / Math.max(1, timelineDisplayDuration)) * 100}%` }} /> : null}
           </div>
         </div>
@@ -2169,8 +2238,10 @@ function EditorView(props: {
               <div className="track-label">{track.name}</div>
               <div
                 className="track-lane timeline-scrub-area"
-                onPointerDown={beginScrub}
-                onPointerMove={continueScrub}
+                onPointerDown={beginTimelineSelection}
+                onPointerMove={updateTimelineSelection}
+                onPointerUp={endTimelineSelection}
+                onPointerCancel={endTimelineSelection}
                 onDragOver={(event) => {
                   event.dataTransfer.dropEffect = event.dataTransfer.types.includes('application/x-inhouse-asset') ? 'copy' : 'move';
                   updateTimelineDragPreview(event, track.id);
@@ -2184,7 +2255,8 @@ function EditorView(props: {
                     const width = (clip.duration / Math.max(1, timelineDisplayDuration)) * 100;
                     return (
                       <div
-                        key={clip.id}
+                      key={clip.id}
+                      data-clip-id={clip.id}
                         className={`timeline-clip ${clip.type} ${selectedClipIds.includes(clip.id) ? 'selected' : ''} ${timelineDragPreview?.source === 'clip' && timelineDragPreview.id === clip.id ? 'dragging-source' : ''}`}
                         style={{ left: `${left}%`, width: `${width}%` }}
                         role="button"
@@ -2228,6 +2300,7 @@ function EditorView(props: {
               </div>
             </div>
           ))}
+          {timelineSelectionBox ? <div className="timeline-selection-box" style={timelineSelectionBox} /> : null}
         </div>
       </section>
 
