@@ -29,7 +29,7 @@ import { ChangeEvent, CSSProperties, DragEvent, PointerEvent as ReactPointerEven
 import { createDriveClient } from './drive';
 import { DRIVE_SYNC_DEBOUNCE_MS, PROJECT_APP_PROPERTY, PROJECT_FILE_NAME, PROJECT_FOLDER_PROPERTY } from './constants';
 import { loadStoredState, persistStoredState } from './storage';
-import type { AssetRecord, DriveClient, DriveFolder, DriveProjectFile, FolderPickerResult, ProjectRecord, SaveStatus, TimelineItem } from './types';
+import type { AssetRecord, DriveClient, DriveFolder, DriveProjectFile, FolderPickerResult, ProjectRecord, SaveStatus, TimelineItem, TimelineTrack } from './types';
 import {
   assetKindFromFile,
   clamp,
@@ -53,6 +53,17 @@ type BinEntry = {
   modifiedTime?: string;
   driveId?: string;
   projectId?: string;
+};
+
+type TimelineDragPreview = {
+  source: 'asset' | 'clip';
+  id: string;
+  kind: TimelineItem['type'];
+  start: number;
+  duration: number;
+  requestedTrackId: string;
+  resolvedTrackId?: string;
+  snapTime?: number;
 };
 
 function RoofLogo() {
@@ -97,6 +108,11 @@ function readAssetMetadata(kind: AssetRecord['kind'], objectUrl: string): Promis
     media.onerror = () => resolve({});
     media.src = objectUrl;
   });
+}
+
+function timelineItemsOverlap(start: number, duration: number, other: TimelineItem): boolean {
+  const epsilon = 0.001;
+  return start < other.start + other.duration - epsilon && start + duration > other.start + epsilon;
 }
 
 export function App() {
@@ -467,7 +483,7 @@ export function App() {
       const duration = asset.kind === 'image' ? 5 : clamp(asset.duration || 6, 0.2, 60 * 60);
       const safeStart = clamp(start, 0, Math.max(project.duration, start));
       let track = project.tracks.find((item) => item.id === requestedTrackId && item.kind === trackKind);
-      const overlaps = (trackId: string) => project.timeline.some((clip) => clip.trackId === trackId && safeStart < clip.start + clip.duration && safeStart + duration > clip.start);
+      const overlaps = (trackId: string) => project.timeline.some((clip) => clip.trackId === trackId && timelineItemsOverlap(safeStart, duration, clip));
       if (!track || overlaps(track.id)) track = project.tracks.find((item) => item.kind === trackKind && !overlaps(item.id));
       let tracks = project.tracks;
       if (!track) {
@@ -499,7 +515,7 @@ export function App() {
       const trackKind = moving.type === 'audio' ? 'audio' : moving.type === 'text' ? 'text' : 'video';
       const safeStart = Math.max(0, start);
       let track = project.tracks.find((item) => item.id === requestedTrackId && item.kind === trackKind);
-      const overlaps = (trackId: string) => project.timeline.some((clip) => clip.id !== clipId && clip.trackId === trackId && safeStart < clip.start + clip.duration && safeStart + moving.duration > clip.start);
+      const overlaps = (trackId: string) => project.timeline.some((clip) => clip.id !== clipId && clip.trackId === trackId && timelineItemsOverlap(safeStart, moving.duration, clip));
       if (!track || overlaps(track.id)) track = project.tracks.find((item) => item.kind === trackKind && !overlaps(item.id));
       let tracks = project.tracks;
       if (!track) {
@@ -607,7 +623,26 @@ export function App() {
 
   function updateClip(clipId: string, patch: Partial<TimelineItem>) {
     patchActiveProject((project) => {
-      const timeline = project.timeline.map((clip) => clip.id === clipId ? { ...clip, ...patch } : clip);
+      const current = project.timeline.find((clip) => clip.id === clipId);
+      if (!current) return project;
+      let updated = { ...current, ...patch };
+      if (patch.start !== undefined || patch.duration !== undefined) {
+        const siblings = project.timeline.filter((clip) => clip.id !== clipId && clip.trackId === current.trackId);
+        if (patch.start !== undefined && patch.duration === undefined) {
+          const candidates = [Math.max(0, updated.start), ...siblings.flatMap((clip) => [clip.start + clip.duration, Math.max(0, clip.start - updated.duration)])];
+          const validStarts = candidates.filter((start) => !siblings.some((clip) => timelineItemsOverlap(start, updated.duration, clip)));
+          updated = { ...updated, start: validStarts.sort((a, b) => Math.abs(a - updated.start) - Math.abs(b - updated.start))[0] ?? current.start };
+        } else {
+          const proposedEnd = updated.start + updated.duration;
+          const previousEnd = siblings.filter((clip) => clip.start < updated.start).reduce((end, clip) => Math.max(end, clip.start + clip.duration), 0);
+          const nextStart = siblings.filter((clip) => clip.start >= updated.start).reduce((start, clip) => Math.min(start, clip.start), Number.POSITIVE_INFINITY);
+          const safeStart = Math.max(previousEnd, updated.start);
+          const safeDuration = Math.max(0.2, Math.min(proposedEnd - safeStart, nextStart - safeStart));
+          updated = { ...updated, start: safeStart, duration: Number.isFinite(safeDuration) ? safeDuration : updated.duration };
+        }
+        if (siblings.some((clip) => timelineItemsOverlap(updated.start, updated.duration, clip))) updated = current;
+      }
+      const timeline = project.timeline.map((clip) => clip.id === clipId ? updated : clip);
       return {
         ...project,
         timeline,
@@ -1339,6 +1374,8 @@ function EditorView(props: {
   const [timelineZoom, setTimelineZoom] = useState(1);
   const [timelineOffset, setTimelineOffset] = useState(0);
   const [timelineViewportWidth, setTimelineViewportWidth] = useState(1);
+  const [timelineDragPreview, setTimelineDragPreview] = useState<TimelineDragPreview | null>(null);
+  const [trimSnapTime, setTrimSnapTime] = useState<number | undefined>();
   const previewCanvasRef = useRef<HTMLDivElement>(null);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const appliedFocusRef = useRef<string | undefined>(undefined);
@@ -1353,6 +1390,14 @@ function EditorView(props: {
     inspectorWidth: number;
     timelineHeight: number;
   } | null>(null);
+  const timelineDragSourceRef = useRef<{
+    source: 'asset' | 'clip';
+    id: string;
+    kind: TimelineItem['type'];
+    duration: number;
+    grabOffset: number;
+  } | null>(null);
+  const timelineDragPreviewRef = useRef<TimelineDragPreview | null>(null);
   const transformGestureRef = useRef<{
     mode: 'move' | 'scale';
     pointerId: number;
@@ -1387,6 +1432,7 @@ function EditorView(props: {
   const timelineContentWidth = timelineViewportWidth * Math.max(1, timelineZoom);
   const timelinePixelsPerSecond = timelineContentWidth / Math.max(1, timelineDisplayDuration);
   const timelineTickStep = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600].find((step) => step * timelinePixelsPerSecond >= 52) || 3600;
+  const visibleSnapTime = timelineDragPreview?.snapTime ?? trimSnapTime;
 
   useEffect(() => {
     if (!props.focusedClipId || appliedFocusRef.current === props.focusedClipId) return;
@@ -1431,15 +1477,80 @@ function EditorView(props: {
     setSelectedAssetId(assetId);
   };
 
+  const timelineTrackKind = (kind: TimelineItem['type']) => kind === 'audio' ? 'audio' : kind === 'text' ? 'text' : 'video';
+
+  const resolveTimelineTrack = (kind: TimelineItem['type'], start: number, duration: number, requestedTrackId: string, excludeClipId?: string) => {
+    const requiredKind = timelineTrackKind(kind);
+    const isFree = (trackId: string) => !props.project.timeline.some((clip) => clip.id !== excludeClipId && clip.trackId === trackId && timelineItemsOverlap(start, duration, clip));
+    const requested = props.project.tracks.find((track) => track.id === requestedTrackId && track.kind === requiredKind);
+    if (requested && isFree(requested.id)) return requested.id;
+    return props.project.tracks.find((track) => track.kind === requiredKind && isFree(track.id))?.id;
+  };
+
+  const timelineSnapCandidates = (excludeClipId?: string) => [
+    0,
+    playhead,
+    ...props.project.timeline
+      .filter((clip) => clip.id !== excludeClipId)
+      .flatMap((clip) => [clip.start, clip.start + clip.duration])
+  ];
+
+  const snapTimelineStart = (rawStart: number, duration: number, excludeClipId?: string) => {
+    const thresholdSeconds = clamp(10 / Math.max(0.001, timelinePixelsPerSecond), 1 / props.project.fps, 1.5);
+    const candidates = timelineSnapCandidates(excludeClipId);
+    let bestStart = Math.max(0, rawStart);
+    let snapTime: number | undefined;
+    let bestDistance = thresholdSeconds + Number.EPSILON;
+    candidates.forEach((candidate) => {
+      [candidate - rawStart, candidate - (rawStart + duration)].forEach((delta) => {
+        const distance = Math.abs(delta);
+        if (distance <= bestDistance && rawStart + delta >= 0) {
+          bestDistance = distance;
+          bestStart = rawStart + delta;
+          snapTime = candidate;
+        }
+      });
+    });
+    if (snapTime === undefined) bestStart = Math.max(0, Math.round(rawStart * props.project.fps) / props.project.fps);
+    return { start: bestStart, snapTime };
+  };
+
+  const updateTimelineDragPreview = (event: DragEvent<HTMLElement>, requestedTrackId: string) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const source = timelineDragSourceRef.current;
+    if (!source) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const pointerTime = (event.clientX - bounds.left + timelineOffset) / Math.max(0.001, timelinePixelsPerSecond);
+    const snapped = snapTimelineStart(pointerTime - source.grabOffset, source.duration, source.source === 'clip' ? source.id : undefined);
+    const resolvedTrackId = requestedTrackId.startsWith('__new_')
+      ? undefined
+      : resolveTimelineTrack(source.kind, snapped.start, source.duration, requestedTrackId, source.source === 'clip' ? source.id : undefined);
+    const nextPreview: TimelineDragPreview = {
+      source: source.source,
+      id: source.id,
+      kind: source.kind,
+      start: snapped.start,
+      duration: source.duration,
+      requestedTrackId,
+      resolvedTrackId,
+      snapTime: snapped.snapTime
+    };
+    timelineDragPreviewRef.current = nextPreview;
+    setTimelineDragPreview(nextPreview);
+  };
+
   const dropOnTrack = (event: DragEvent<HTMLElement>, trackId: string) => {
     event.preventDefault();
     event.stopPropagation();
-    const bounds = event.currentTarget.getBoundingClientRect();
-    const start = clamp((event.clientX - bounds.left + timelineOffset) / Math.max(0.001, timelinePixelsPerSecond), 0, props.project.duration);
-    const assetId = event.dataTransfer.getData('application/x-inhouse-asset');
-    const clipId = event.dataTransfer.getData('application/x-inhouse-clip');
-    if (assetId) props.onPlaceAsset(assetId, start, trackId);
-    else if (clipId) props.onMoveTimelineClip(clipId, start, trackId);
+    const preview = timelineDragPreviewRef.current;
+    if (!preview) return;
+    const destinationTrackId = preview.resolvedTrackId || trackId;
+    if (preview.source === 'asset') props.onPlaceAsset(preview.id, preview.start, destinationTrackId);
+    else props.onMoveTimelineClip(preview.id, preview.start, destinationTrackId);
+    timelineDragSourceRef.current = null;
+    timelineDragPreviewRef.current = null;
+    setTimelineDragPreview(null);
   };
 
   const beginTrim = (event: ReactPointerEvent<HTMLElement>, clip: TimelineItem, edge: 'start' | 'end') => {
@@ -1448,6 +1559,7 @@ function EditorView(props: {
     const lane = event.currentTarget.closest('.track-lane');
     if (!(lane instanceof HTMLElement)) return;
     event.currentTarget.setPointerCapture(event.pointerId);
+    setTrimSnapTime(undefined);
     trimGestureRef.current = {
       pointerId: event.pointerId,
       clipId: clip.id,
@@ -1464,11 +1576,22 @@ function EditorView(props: {
     const gesture = trimGestureRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) return;
     const delta = (event.clientX - gesture.startX) / gesture.pixelsPerSecond;
+    const thresholdSeconds = clamp(10 / Math.max(0.001, gesture.pixelsPerSecond), 1 / props.project.fps, 1.5);
+    const snapValue = (rawTime: number) => {
+      const candidate = timelineSnapCandidates(gesture.clipId)
+        .map((time) => ({ time, distance: Math.abs(time - rawTime) }))
+        .filter((entry) => entry.distance <= thresholdSeconds)
+        .sort((a, b) => a.distance - b.distance)[0];
+      setTrimSnapTime(candidate?.time);
+      return candidate?.time ?? rawTime;
+    };
     if (gesture.edge === 'end') {
-      props.onUpdateClip(gesture.clipId, { duration: Math.max(0.2, gesture.originDuration + delta) });
+      const end = snapValue(gesture.originStart + gesture.originDuration + delta);
+      props.onUpdateClip(gesture.clipId, { duration: Math.max(0.2, end - gesture.originStart) });
       return;
     }
-    const appliedDelta = clamp(delta, -gesture.originStart, gesture.originDuration - 0.2);
+    const start = snapValue(gesture.originStart + delta);
+    const appliedDelta = clamp(start - gesture.originStart, -gesture.originStart, gesture.originDuration - 0.2);
     props.onUpdateClip(gesture.clipId, {
       start: gesture.originStart + appliedDelta,
       duration: gesture.originDuration - appliedDelta,
@@ -1477,12 +1600,30 @@ function EditorView(props: {
   };
 
   const endTrim = (event: ReactPointerEvent<HTMLElement>) => {
-    if (trimGestureRef.current?.pointerId === event.pointerId) trimGestureRef.current = null;
+    if (trimGestureRef.current?.pointerId === event.pointerId) {
+      trimGestureRef.current = null;
+      setTrimSnapTime(undefined);
+    }
   };
 
   const currentAssetFolder = assetFolderId ? props.project.assetFolders.find((folder) => folder.id === assetFolderId) : undefined;
   const visibleAssetFolders = showAssetBin ? [] : props.project.assetFolders.filter((folder) => folder.parentId === assetFolderId);
   const visibleAssets = props.project.assets.filter((asset) => showAssetBin ? !!asset.trashedAt : !asset.trashedAt && asset.folderId === assetFolderId);
+  const timelineTracksForRender: Array<TimelineTrack & { virtual?: boolean }> = [...props.project.tracks];
+  if (timelineDragPreview && !timelineDragPreview.resolvedTrackId) {
+    const kind = timelineTrackKind(timelineDragPreview.kind);
+    const virtualTrack: TimelineTrack & { virtual: boolean } = {
+      id: `__new_${kind}`,
+      name: 'Nueva capa',
+      kind,
+      locked: false,
+      muted: false,
+      virtual: true
+    };
+    const firstMatchingTrack = timelineTracksForRender.findIndex((track) => track.kind === kind);
+    if (kind === 'audio' || firstMatchingTrack < 0) timelineTracksForRender.push(virtualTrack);
+    else timelineTracksForRender.splice(firstMatchingTrack, 0, virtualTrack);
+  }
 
   useEffect(() => {
     const canvas = previewCanvasRef.current;
@@ -1724,9 +1865,12 @@ function EditorView(props: {
                   className="asset-open-button"
                   draggable={!showAssetBin}
                   onDragStart={(event) => {
+                    const duration = asset.kind === 'image' ? 5 : clamp(asset.duration || 6, 0.2, 60 * 60);
+                    timelineDragSourceRef.current = { source: 'asset', id: asset.id, kind: asset.kind, duration, grabOffset: 0 };
                     event.dataTransfer.setData('application/x-inhouse-asset', asset.id);
                     event.dataTransfer.effectAllowed = 'copy';
                   }}
+                  onDragEnd={() => { timelineDragSourceRef.current = null; timelineDragPreviewRef.current = null; setTimelineDragPreview(null); }}
                   onClick={() => focusAsset(asset.id)}
                   onDoubleClick={() => props.onPlaceAsset(asset.id, playhead)}
                   title="Arrastra a la timeline o haz doble clic"
@@ -1955,17 +2099,21 @@ function EditorView(props: {
               return <span key={tick} style={{ left: `${(tick / Math.max(1, timelineDisplayDuration)) * 100}%` }}>{tick}s</span>;
             })}
             <div className="playhead" style={{ left: `${(playhead / Math.max(1, timelineDisplayDuration)) * 100}%` }} />
+            {visibleSnapTime !== undefined ? <div className="timeline-snap-guide ruler" style={{ left: `${(visibleSnapTime / Math.max(1, timelineDisplayDuration)) * 100}%` }} /> : null}
           </div>
         </div>
         <div className="tracks" ref={tracksRef} onWheel={handleTimelineWheel}>
-          {props.project.tracks.map((track) => (
-            <div className="track-row" key={track.id}>
+          {timelineTracksForRender.map((track) => (
+            <div className={`track-row ${track.virtual ? 'virtual' : ''}`} key={track.id}>
               <div className="track-label">{track.name}</div>
               <div
                 className="track-lane timeline-scrub-area"
                 onPointerDown={beginScrub}
                 onPointerMove={continueScrub}
-                onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = event.dataTransfer.types.includes('application/x-inhouse-asset') ? 'copy' : 'move'; }}
+                onDragOver={(event) => {
+                  event.dataTransfer.dropEffect = event.dataTransfer.types.includes('application/x-inhouse-asset') ? 'copy' : 'move';
+                  updateTimelineDragPreview(event, track.id);
+                }}
                 onDrop={(event) => dropOnTrack(event, track.id)}
               >
                 <div className="track-lane-content" style={{ width: timelineContentWidth, transform: `translateX(${-timelineOffset}px)` }}>
@@ -1976,16 +2124,26 @@ function EditorView(props: {
                     return (
                       <div
                         key={clip.id}
-                        className={`timeline-clip ${clip.type} ${selectedClipId === clip.id ? 'selected' : ''}`}
+                        className={`timeline-clip ${clip.type} ${selectedClipId === clip.id ? 'selected' : ''} ${timelineDragPreview?.source === 'clip' && timelineDragPreview.id === clip.id ? 'dragging-source' : ''}`}
                         style={{ left: `${left}%`, width: `${width}%` }}
                         role="button"
                         tabIndex={0}
                         draggable
                         onDragStart={(event) => {
                           event.stopPropagation();
+                          const bounds = event.currentTarget.getBoundingClientRect();
+                          timelineDragSourceRef.current = {
+                            source: 'clip',
+                            id: clip.id,
+                            kind: clip.type,
+                            duration: clip.duration,
+                            grabOffset: clamp((event.clientX - bounds.left) / Math.max(0.001, timelinePixelsPerSecond), 0, clip.duration)
+                          };
+                          setSelectedClipId(clip.id);
                           event.dataTransfer.setData('application/x-inhouse-clip', clip.id);
                           event.dataTransfer.effectAllowed = 'move';
                         }}
+                        onDragEnd={() => { timelineDragSourceRef.current = null; timelineDragPreviewRef.current = null; setTimelineDragPreview(null); }}
                         onClick={() => setSelectedClipId(clip.id)}
                       >
                         <button className="clip-trim-handle start" aria-label="Ajustar inicio" onPointerDown={(event) => beginTrim(event, clip, 'start')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
@@ -1994,7 +2152,17 @@ function EditorView(props: {
                       </div>
                     );
                   })}
+                  {timelineDragPreview && ((timelineDragPreview.resolvedTrackId === track.id) || (track.virtual && !timelineDragPreview.resolvedTrackId)) ? (
+                    <div
+                      className={`timeline-drop-preview ${timelineDragPreview.kind}`}
+                      style={{
+                        left: `${(timelineDragPreview.start / Math.max(1, timelineDisplayDuration)) * 100}%`,
+                        width: `${(timelineDragPreview.duration / Math.max(1, timelineDisplayDuration)) * 100}%`
+                      }}
+                    />
+                  ) : null}
                   <div className="track-playhead" style={{ left: `${(playhead / Math.max(1, timelineDisplayDuration)) * 100}%` }} />
+                  {visibleSnapTime !== undefined ? <div className="timeline-snap-guide" style={{ left: `${(visibleSnapTime / Math.max(1, timelineDisplayDuration)) * 100}%` }} /> : null}
                 </div>
               </div>
             </div>

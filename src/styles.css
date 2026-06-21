@@ -1745,6 +1745,16 @@ button {
   border-bottom: 1px solid var(--border-soft);
 }
 
+.track-row.virtual {
+  background: rgba(224, 122, 60, 0.055);
+  border-top: 1px dashed rgba(224, 122, 60, 0.4);
+  border-bottom: 1px dashed rgba(224, 122, 60, 0.4);
+}
+
+.track-row.virtual .track-label {
+  color: var(--accent-orange);
+}
+
 .track-label {
   border-radius: 0;
   background: transparent;
@@ -1774,6 +1784,44 @@ button {
   pointer-events: none;
 }
 
+.timeline-snap-guide {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 26;
+  width: 1px;
+  background: var(--accent-orange);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.58);
+  pointer-events: none;
+}
+
+.timeline-snap-guide.ruler {
+  z-index: 5;
+}
+
+.timeline-drop-preview {
+  position: absolute;
+  top: 5px;
+  bottom: 5px;
+  z-index: 18;
+  min-width: 2px;
+  border: 2px solid rgba(255, 255, 255, 0.92);
+  border-radius: 6px;
+  background: rgba(37, 99, 235, 0.62);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.42);
+  pointer-events: none;
+}
+
+.timeline-drop-preview.audio {
+  background: rgba(22, 163, 74, 0.62);
+  box-shadow: 0 0 0 2px rgba(22, 163, 74, 0.38);
+}
+
+.timeline-drop-preview.text {
+  background: rgba(224, 122, 60, 0.68);
+  box-shadow: 0 0 0 2px rgba(224, 122, 60, 0.38);
+}
+
 .timeline-clip {
   position: absolute;
   top: 7px;
@@ -1794,6 +1842,10 @@ button {
 
 .timeline-clip:active {
   cursor: grabbing;
+}
+
+.timeline-clip.dragging-source {
+  opacity: 0.35;
 }
 
 .timeline-clip > span {

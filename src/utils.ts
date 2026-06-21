@@ -1,4 +1,4 @@
-import type { AssetKind, ProjectRecord, TimelineTrack, TransformRecord } from './types';
+import type { AssetKind, ProjectRecord, TimelineItem, TimelineTrack, TransformRecord } from './types';
 
 export function uid(prefix: string): string {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -82,6 +82,33 @@ export function sanitizeProjectName(value: string): string {
 
 export function normalizeLoadedProject(raw: Partial<ProjectRecord>): ProjectRecord {
   const fallback = createEmptyProject(raw.name || 'nuevo video');
+  const tracks = Array.isArray(raw.tracks) && raw.tracks.length ? [...raw.tracks] : createDefaultTracks();
+  const timeline = Array.isArray(raw.timeline) ? raw.timeline.map((clip) => ({ ...clip })) : [];
+  const assigned = new Map<string, TimelineItem[]>();
+  const trackKindForClip = (clip: TimelineItem) => clip.type === 'audio' ? 'audio' : clip.type === 'text' ? 'text' : 'video';
+  timeline
+    .sort((a, b) => a.start - b.start)
+    .forEach((clip) => {
+      const kind = trackKindForClip(clip);
+      const candidates = [
+        ...tracks.filter((track) => track.id === clip.trackId && track.kind === kind),
+        ...tracks.filter((track) => track.id !== clip.trackId && track.kind === kind)
+      ];
+      let target = candidates.find((track) => !(assigned.get(track.id) || []).some((other) => clip.start < other.start + other.duration - 0.001 && clip.start + clip.duration > other.start + 0.001));
+      if (!target) {
+        const count = tracks.filter((track) => track.kind === kind).length + 1;
+        target = {
+          id: `track_${kind}_recovered_${count}`,
+          name: `${kind === 'video' ? 'Video' : kind === 'audio' ? 'Audio' : 'Texto'} ${count}`,
+          kind,
+          locked: false,
+          muted: false
+        };
+        tracks.push(target);
+      }
+      clip.trackId = target.id;
+      assigned.set(target.id, [...(assigned.get(target.id) || []), clip]);
+    });
   return {
     ...fallback,
     ...raw,
@@ -89,8 +116,8 @@ export function normalizeLoadedProject(raw: Partial<ProjectRecord>): ProjectReco
     name: sanitizeProjectName(raw.name || fallback.name),
     assets: Array.isArray(raw.assets) ? raw.assets : [],
     assetFolders: Array.isArray(raw.assetFolders) ? raw.assetFolders : [],
-    tracks: Array.isArray(raw.tracks) && raw.tracks.length ? raw.tracks : createDefaultTracks(),
-    timeline: Array.isArray(raw.timeline) ? raw.timeline : [],
+    tracks,
+    timeline,
     duration: Number(raw.duration) || fallback.duration,
     width: Number(raw.width) || fallback.width,
     height: Number(raw.height) || fallback.height,
