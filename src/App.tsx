@@ -651,28 +651,30 @@ export function App() {
     });
   }
 
-  function splitClip(clipId: string) {
-    if (!activeProject) return;
-    const clip = activeProject.timeline.find((item) => item.id === clipId);
-    if (!clip || clip.duration <= 1) return;
-    const firstDuration = Number((clip.duration / 2).toFixed(2));
-    const secondDuration = Number((clip.duration - firstDuration).toFixed(2));
-    patchActiveProject((project) => ({
-      ...project,
-      timeline: project.timeline.flatMap((item) => {
-        if (item.id !== clipId) return [item];
+  function splitAtPlayhead(time: number, selectedClipIds: string[]) {
+    patchActiveProject((project) => {
+      const frameDuration = 1 / Math.max(1, project.fps);
+      const selected = new Set(selectedClipIds);
+      const targetIds = selected.size
+        ? selected
+        : new Set(project.timeline.filter((clip) => time > clip.start + frameDuration && time < clip.start + clip.duration - frameDuration).map((clip) => clip.id));
+      const timeline = project.timeline.flatMap((clip) => {
+        if (!targetIds.has(clip.id) || time <= clip.start + frameDuration || time >= clip.start + clip.duration - frameDuration) return [clip];
+        const firstDuration = Number((time - clip.start).toFixed(4));
+        const secondDuration = Number((clip.duration - firstDuration).toFixed(4));
         return [
-          { ...item, duration: firstDuration },
+          { ...clip, duration: firstDuration },
           {
-            ...item,
+            ...clip,
             id: uid('clip'),
-            start: item.start + firstDuration,
+            start: time,
             duration: secondDuration,
-            trimStart: (item.trimStart || 0) + firstDuration
+            trimStart: (clip.trimStart || 0) + firstDuration
           }
         ];
-      })
-    }));
+      });
+      return { ...project, timeline };
+    });
   }
 
   function deleteClip(clipId: string) {
@@ -747,7 +749,7 @@ export function App() {
         onTrashAsset={trashAsset}
         onRestoreAsset={restoreAsset}
         onUpdateClip={updateClip}
-        onSplitClip={splitClip}
+        onSplitAtPlayhead={splitAtPlayhead}
         onDeleteClip={deleteClip}
         onExport={exportVideo}
       />
@@ -1355,13 +1357,14 @@ function EditorView(props: {
   onTrashAsset(assetId: string): void;
   onRestoreAsset(assetId: string): void;
   onUpdateClip(clipId: string, patch: Partial<TimelineItem>): void;
-  onSplitClip(clipId: string): void;
+  onSplitAtPlayhead(time: number, selectedClipIds: string[]): void;
   onDeleteClip(clipId: string): void;
   onExport(): void;
 }) {
   const [playhead, setPlayhead] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [selectedClipId, setSelectedClipId] = useState<string | undefined>();
+  const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
   const [selectedAssetId, setSelectedAssetId] = useState<string | undefined>();
   const [assetFolderId, setAssetFolderId] = useState<string | undefined>();
   const [isCreatingAssetFolder, setCreatingAssetFolder] = useState(false);
@@ -1433,6 +1436,25 @@ function EditorView(props: {
   const timelinePixelsPerSecond = timelineContentWidth / Math.max(1, timelineDisplayDuration);
   const timelineTickStep = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600].find((step) => step * timelinePixelsPerSecond >= 52) || 3600;
   const visibleSnapTime = timelineDragPreview?.snapTime ?? trimSnapTime;
+  const selectClip = (clipId: string, additive = false) => {
+    if (!additive) {
+      setSelectedClipId(clipId);
+      setSelectedClipIds([clipId]);
+      return;
+    }
+    const next = selectedClipIds.includes(clipId)
+      ? selectedClipIds.filter((id) => id !== clipId)
+      : [...selectedClipIds, clipId];
+    setSelectedClipIds(next);
+    setSelectedClipId(next.includes(clipId) ? clipId : next[next.length - 1]);
+  };
+  const clearClipSelection = () => {
+    setSelectedClipId(undefined);
+    setSelectedClipIds([]);
+  };
+  const splittableClipIds = (selectedClipIds.length ? props.project.timeline.filter((clip) => selectedClipIds.includes(clip.id)) : props.project.timeline)
+    .filter((clip) => playhead > clip.start + 1 / props.project.fps && playhead < clip.start + clip.duration - 1 / props.project.fps)
+    .map((clip) => clip.id);
 
   useEffect(() => {
     if (!props.focusedClipId || appliedFocusRef.current === props.focusedClipId) return;
@@ -1440,9 +1462,29 @@ function EditorView(props: {
     if (!clip) return;
     appliedFocusRef.current = props.focusedClipId;
     setPlaying(false);
-    setSelectedClipId(clip.id);
+    selectClip(clip.id);
     setPlayhead(Math.min(props.project.duration, clip.start + 0.001));
   }, [props.focusedClipId, props.project.timeline, props.project.duration]);
+
+  useEffect(() => {
+    const validIds = selectedClipIds.filter((id) => props.project.timeline.some((clip) => clip.id === id));
+    if (validIds.length !== selectedClipIds.length) {
+      setSelectedClipIds(validIds);
+      if (!selectedClipId || !validIds.includes(selectedClipId)) setSelectedClipId(validIds[validIds.length - 1]);
+    }
+  }, [props.project.timeline, selectedClipId, selectedClipIds]);
+
+  useEffect(() => {
+    const handleCutShortcut = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'b') return;
+      const target = event.target as HTMLElement | null;
+      if (target?.matches('input, textarea, [contenteditable="true"]') || !splittableClipIds.length) return;
+      event.preventDefault();
+      props.onSplitAtPlayhead(playhead, selectedClipIds);
+    };
+    window.addEventListener('keydown', handleCutShortcut);
+    return () => window.removeEventListener('keydown', handleCutShortcut);
+  }, [playhead, props, selectedClipIds, splittableClipIds.length]);
 
   useEffect(() => {
     activeVisualClips.forEach((clip) => {
@@ -1465,6 +1507,7 @@ function EditorView(props: {
 
   const beginScrub = (event: ReactPointerEvent<HTMLElement>) => {
     if ((event.target as HTMLElement).closest('.timeline-clip')) return;
+    clearClipSelection();
     event.currentTarget.setPointerCapture(event.pointerId);
     seekFromPointer(event);
   };
@@ -1725,7 +1768,7 @@ function EditorView(props: {
     if (clip.type === 'audio') return;
     event.preventDefault();
     event.stopPropagation();
-    setSelectedClipId(clip.id);
+    selectClip(clip.id, event.ctrlKey || event.metaKey || event.shiftKey);
     event.currentTarget.setPointerCapture(event.pointerId);
     transformGestureRef.current = {
       mode,
@@ -1940,7 +1983,7 @@ function EditorView(props: {
                 return (
                   <div
                     key={clip.id}
-                    className={`preview-media-layer ${asset.kind} ${selectedClipId === clip.id ? 'selected' : ''}`}
+                    className={`preview-media-layer ${asset.kind} ${selectedClipIds.includes(clip.id) ? 'selected' : ''}`}
                     style={{
                       width: `${mediaWidth}%`,
                       height: `${mediaHeight}%`,
@@ -1980,7 +2023,7 @@ function EditorView(props: {
                 .filter((clip) => clip.type === 'text' && clip.start <= playhead && clip.start + clip.duration >= playhead)
                 .map((clip) => (
                   <div
-                    className={`preview-text-layer ${selectedClipId === clip.id ? 'selected' : ''}`}
+                    className={`preview-text-layer ${selectedClipIds.includes(clip.id) ? 'selected' : ''}`}
                     key={clip.id}
                     style={{
                       left: `${50 + clip.transform.x}%`,
@@ -2055,7 +2098,7 @@ function EditorView(props: {
               <label>Opacidad <input type="range" min={0} max={100} value={selectedClip.transform.opacity} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, opacity: Number(event.target.value) } })} /></label>
               <div className="inspector-actions">
                 {selectedClip.type !== 'audio' ? <button className="btn btn-secondary btn-icon-square" title="Restablecer transformacion" onClick={() => props.onUpdateClip(selectedClip.id, { transform: defaultTransform() })}><RotateCcw size={15} /></button> : null}
-                <button className="btn btn-secondary" onClick={() => props.onSplitClip(selectedClip.id)}><Scissors size={15} /> Dividir</button>
+                <button className="btn btn-secondary" disabled={!splittableClipIds.length} onClick={() => props.onSplitAtPlayhead(playhead, selectedClipIds)}><Scissors size={15} /> Dividir</button>
                 <button className="btn btn-secondary danger" onClick={() => props.onDeleteClip(selectedClip.id)}><Trash2 size={15} /> Borrar</button>
               </div>
             </div>
@@ -2080,6 +2123,15 @@ function EditorView(props: {
       <section className="timeline-panel">
         <div className="timeline-toolbar">
           <div className="timeline-actions">
+            <button
+              className="btn btn-secondary btn-icon-square"
+              title={selectedClipIds.length ? 'Cortar seleccion en el playhead (Ctrl+B)' : 'Cortar todas las capas en el playhead (Ctrl+B)'}
+              aria-label="Cortar en el playhead"
+              disabled={!splittableClipIds.length}
+              onClick={() => props.onSplitAtPlayhead(playhead, selectedClipIds)}
+            >
+              <Scissors size={16} />
+            </button>
             <button className="btn btn-secondary" onClick={props.onAddText}><Type size={16} /> Texto</button>
             <button className="btn btn-secondary" onClick={props.onPickFiles}><Upload size={16} /> Importar</button>
           </div>
@@ -2124,7 +2176,7 @@ function EditorView(props: {
                     return (
                       <div
                         key={clip.id}
-                        className={`timeline-clip ${clip.type} ${selectedClipId === clip.id ? 'selected' : ''} ${timelineDragPreview?.source === 'clip' && timelineDragPreview.id === clip.id ? 'dragging-source' : ''}`}
+                        className={`timeline-clip ${clip.type} ${selectedClipIds.includes(clip.id) ? 'selected' : ''} ${timelineDragPreview?.source === 'clip' && timelineDragPreview.id === clip.id ? 'dragging-source' : ''}`}
                         style={{ left: `${left}%`, width: `${width}%` }}
                         role="button"
                         tabIndex={0}
@@ -2139,12 +2191,12 @@ function EditorView(props: {
                             duration: clip.duration,
                             grabOffset: clamp((event.clientX - bounds.left) / Math.max(0.001, timelinePixelsPerSecond), 0, clip.duration)
                           };
-                          setSelectedClipId(clip.id);
+                          if (!selectedClipIds.includes(clip.id)) selectClip(clip.id);
                           event.dataTransfer.setData('application/x-inhouse-clip', clip.id);
                           event.dataTransfer.effectAllowed = 'move';
                         }}
                         onDragEnd={() => { timelineDragSourceRef.current = null; timelineDragPreviewRef.current = null; setTimelineDragPreview(null); }}
-                        onClick={() => setSelectedClipId(clip.id)}
+                        onClick={(event) => selectClip(clip.id, event.ctrlKey || event.metaKey || event.shiftKey)}
                       >
                         <button className="clip-trim-handle start" aria-label="Ajustar inicio" onPointerDown={(event) => beginTrim(event, clip, 'start')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
                         <span>{clip.type === 'text' ? (clip.text || 'Texto') : (asset?.name || clip.type)}</span>
