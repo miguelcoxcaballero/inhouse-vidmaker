@@ -1687,7 +1687,9 @@ button {
 .tracks {
   display: grid;
   gap: 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .track-row {

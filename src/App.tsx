@@ -1336,6 +1336,7 @@ function EditorView(props: {
   const previewCanvasRef = useRef<HTMLDivElement>(null);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const appliedFocusRef = useRef<string | undefined>(undefined);
+  const tracksRef = useRef<HTMLDivElement>(null);
   const transformGestureRef = useRef<{
     mode: 'move' | 'scale';
     pointerId: number;
@@ -1359,6 +1360,7 @@ function EditorView(props: {
     originTrimStart: number;
   } | null>(null);
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
+  const [timelineScrollbarWidth, setTimelineScrollbarWidth] = useState(0);
   const selectedClip = props.project.timeline.find((clip) => clip.id === selectedClipId);
   const activeVisualClips = props.project.timeline
     .filter((clip) => clip.start <= playhead && playhead < clip.start + clip.duration && (clip.type === 'video' || clip.type === 'image'))
@@ -1481,6 +1483,16 @@ function EditorView(props: {
     updateStageSize();
     return () => observer.disconnect();
   }, [props.project.width, props.project.height]);
+
+  useEffect(() => {
+    const tracks = tracksRef.current;
+    if (!tracks) return;
+    const updateScrollbarWidth = () => setTimelineScrollbarWidth(Math.max(0, tracks.offsetWidth - tracks.clientWidth));
+    const observer = new ResizeObserver(updateScrollbarWidth);
+    observer.observe(tracks);
+    updateScrollbarWidth();
+    return () => observer.disconnect();
+  }, [props.project.tracks.length]);
 
   const beginTransform = (event: ReactPointerEvent<HTMLElement>, clip: TimelineItem, mode: 'move' | 'scale') => {
     if (clip.type === 'audio') return;
@@ -1802,13 +1814,13 @@ function EditorView(props: {
           </div>
           <div className="timeline-meta">{props.project.timeline.length} clips - {props.project.duration.toFixed(1)}s</div>
         </div>
-        <div className="timeline-ruler timeline-scrub-area" onPointerDown={beginScrub} onPointerMove={continueScrub}>
+        <div className="timeline-ruler timeline-scrub-area" style={{ marginRight: timelineScrollbarWidth }} onPointerDown={beginScrub} onPointerMove={continueScrub}>
           {Array.from({ length: Math.ceil(props.project.duration) + 1 }).map((_, index) => (
             <span key={index} style={{ left: `${(index / Math.max(1, props.project.duration)) * 100}%` }}>{index}s</span>
           ))}
           <div className="playhead" style={{ left: `${(playhead / Math.max(1, props.project.duration)) * 100}%` }} />
         </div>
-        <div className="tracks">
+        <div className="tracks" ref={tracksRef}>
           {props.project.tracks.map((track) => (
             <div className="track-row" key={track.id}>
               <div className="track-label">{track.name}</div>
