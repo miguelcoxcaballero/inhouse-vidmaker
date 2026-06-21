@@ -1,5 +1,6 @@
 import {
   ArrowLeft,
+  ChevronDown,
   ChevronRight,
   Download,
   Film,
@@ -44,6 +45,19 @@ import {
 } from './utils';
 
 const drive = createDriveClient();
+const THEME_KEY = 'inhouse-theme';
+
+type ThemeMode = 'light' | 'dark';
+
+function getInitialTheme(): ThemeMode {
+  try {
+    const stored = localStorage.getItem(THEME_KEY);
+    if (stored === 'dark' || stored === 'light') return stored;
+  } catch {
+    // Use the system preference when storage is unavailable.
+  }
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
 
 type DiffusionCore = typeof import('@diffusionstudio/core');
 
@@ -120,6 +134,7 @@ export function App() {
   const [projects, setProjects] = useState<ProjectRecord[]>(initial.projects);
   const [activeProjectId, setActiveProjectId] = useState<string | undefined>(initial.activeProjectId);
   const [profile, setProfile] = useState(drive.profile);
+  const [theme, setTheme] = useState<ThemeMode>(getInitialTheme);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   const [search, setSearch] = useState('');
   const [isFolderPickerOpen, setFolderPickerOpen] = useState(false);
@@ -141,6 +156,34 @@ export function App() {
     () => projects.find((project) => project.id === activeProjectId),
     [activeProjectId, projects]
   );
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
+
+  useEffect(() => {
+    const media = window.matchMedia?.('(prefers-color-scheme: dark)');
+    if (!media) return;
+    const handleSystemTheme = (event: MediaQueryListEvent) => {
+      try {
+        if (localStorage.getItem(THEME_KEY)) return;
+      } catch {
+        // Continue with the system preference.
+      }
+      setTheme(event.matches ? 'dark' : 'light');
+    };
+    media.addEventListener('change', handleSystemTheme);
+    return () => media.removeEventListener('change', handleSystemTheme);
+  }, []);
+
+  const changeTheme = (next: ThemeMode) => {
+    setTheme(next);
+    try {
+      localStorage.setItem(THEME_KEY, next);
+    } catch {
+      // The visual preference still applies for the current session.
+    }
+  };
 
   const visibleProjects = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -732,10 +775,13 @@ export function App() {
       <EditorView
         project={activeProject}
         profile={profile}
+        theme={theme}
         saveStatus={saveStatus}
         isDragging={isDragging}
         focusedClipId={focusedClipId}
         onBack={() => setActiveProjectId(undefined)}
+        onThemeChange={changeTheme}
+        onSignOut={signOut}
         onFiles={addFiles}
         onDragOver={onDragOver}
         onDragLeave={() => setDragging(false)}
@@ -767,6 +813,7 @@ export function App() {
       <DriveHome
         drive={drive}
         profile={profile}
+        theme={theme}
         projects={visibleProjects}
         folders={homeFolders}
         search={search}
@@ -775,6 +822,7 @@ export function App() {
         onSearch={setSearch}
         onSignIn={signIn}
         onSignOut={signOut}
+        onThemeChange={changeTheme}
         onRefresh={() => {
           void refreshDriveProjects();
           void loadDriveFolders(currentFolder.id);
@@ -836,6 +884,7 @@ export function App() {
 function DriveHome(props: {
   drive: DriveClient;
   profile: ReturnType<typeof createDriveClient>['profile'];
+  theme: ThemeMode;
   projects: ProjectRecord[];
   folders: DriveFolder[];
   search: string;
@@ -844,6 +893,7 @@ function DriveHome(props: {
   onSearch(value: string): void;
   onSignIn(): void;
   onSignOut(): void;
+  onThemeChange(theme: ThemeMode): void;
   onRefresh(): void;
   onCreateProject(): void;
   onOpenProject(id: string): void;
@@ -887,6 +937,10 @@ function DriveHome(props: {
                     <div className="drive-profile-email">{props.profile.email}</div>
                   </div>
                 </div>
+                <label className="theme-toggle">
+                  <span>Night mode</span>
+                  <input type="checkbox" aria-label="Night mode" checked={props.theme === 'dark'} onChange={(event) => props.onThemeChange(event.target.checked ? 'dark' : 'light')} />
+                </label>
                 <div className="drive-profile-actions">
                   <button className="btn btn-secondary" onClick={props.onRefresh}>Refresh</button>
                   <button className="btn btn-secondary" onClick={props.onSignOut}>Sign out</button>
@@ -1340,11 +1394,14 @@ function FolderPicker(props: {
 function EditorView(props: {
   project: ProjectRecord;
   profile: ReturnType<typeof createDriveClient>['profile'];
+  theme: ThemeMode;
   saveStatus: SaveStatus;
   isDragging: boolean;
   focusedClipId?: string;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   onBack(): void;
+  onThemeChange(theme: ThemeMode): void;
+  onSignOut(): void;
   onFiles(files: FileList | File[], destinationFolderId?: string): void;
   onDragOver(event: DragEvent<HTMLElement>): void;
   onDragLeave(): void;
@@ -1363,6 +1420,7 @@ function EditorView(props: {
 }) {
   const [playhead, setPlayhead] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [editorProfileOpen, setEditorProfileOpen] = useState(false);
   const [selectedClipId, setSelectedClipId] = useState<string | undefined>();
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
   const [selectedAssetId, setSelectedAssetId] = useState<string | undefined>();
@@ -1405,7 +1463,6 @@ function EditorView(props: {
   } | null>(null);
   const timelineDragPreviewRef = useRef<TimelineDragPreview | null>(null);
   const playheadDragRef = useRef<{ pointerId: number; startX: number } | null>(null);
-  const suppressPlayheadClickRef = useRef(false);
   const timelineSelectionRef = useRef<{
     pointerId: number;
     startX: number;
@@ -1534,7 +1591,6 @@ function EditorView(props: {
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     playheadDragRef.current = { pointerId: event.pointerId, startX: event.clientX };
-    suppressPlayheadClickRef.current = false;
     setPlaying(false);
   };
 
@@ -1542,7 +1598,6 @@ function EditorView(props: {
     const gesture = playheadDragRef.current;
     const ruler = timelineRulerRef.current;
     if (!gesture || !ruler || gesture.pointerId !== event.pointerId) return;
-    if (Math.abs(event.clientX - gesture.startX) > 3) suppressPlayheadClickRef.current = true;
     const bounds = ruler.getBoundingClientRect();
     let nextOffset = timelineOffset;
     if (timelineZoom > 1 && event.clientX < bounds.left + 24) nextOffset -= bounds.left + 24 - event.clientX;
@@ -1972,9 +2027,28 @@ function EditorView(props: {
           <span className={`save-pill ${props.saveStatus}`}>{statusCopy(props.saveStatus)}</span>
           <button className="btn btn-secondary" onClick={props.onBack}><ArrowLeft size={16} /> Home</button>
           <button className="btn btn-primary" onClick={props.onExport}><Download size={16} /> Exportar</button>
-          <button className="drive-profile-btn" title={props.profile?.email || 'Local'}>
-            {props.profile?.picture ? <img className="drive-profile-avatar" src={props.profile.picture} alt="Profile" /> : <User size={19} />}
-          </button>
+          <div className="drive-profile">
+            <button className="drive-profile-btn" title={props.profile?.email || 'Local'} aria-label="Account menu" onClick={() => setEditorProfileOpen((value) => !value)}>
+              {props.profile?.picture ? <img className="drive-profile-avatar" src={props.profile.picture} alt="Profile" /> : <User size={19} />}
+            </button>
+            <div className={`drive-profile-menu ${editorProfileOpen ? '' : 'hidden'}`} role="menu">
+              <div className="drive-profile-meta">
+                {props.profile?.picture ? <img className="drive-profile-avatar" src={props.profile.picture} alt="Profile" /> : <User size={20} />}
+                <div>
+                  <div className="drive-profile-name">{props.profile?.name || 'Signed in'}</div>
+                  <div className="drive-profile-email">{props.profile?.email}</div>
+                </div>
+              </div>
+              <label className="theme-toggle">
+                <span>Night mode</span>
+                <input type="checkbox" aria-label="Night mode" checked={props.theme === 'dark'} onChange={(event) => props.onThemeChange(event.target.checked ? 'dark' : 'light')} />
+              </label>
+              <div className="drive-profile-actions">
+                <button className="btn btn-secondary" onClick={props.onBack}>Home</button>
+                <button className="btn btn-secondary" onClick={props.onSignOut}>Sign out</button>
+              </div>
+            </div>
+          </div>
         </div>
       </header>
 
@@ -2257,23 +2331,16 @@ function EditorView(props: {
             })}
             <div className="playhead" style={{ left: `${(playhead / Math.max(1, timelineDisplayDuration)) * 100}%` }}>
               <button
-                className={`playhead-cut-button ${splittableClipIds.length ? '' : 'cut-unavailable'}`}
-                title={selectedClipIds.length ? 'Arrastra para mover; clic para cortar la seleccion' : 'Arrastra para mover; clic para cortar todas las capas'}
-                aria-label="Mover el playhead o cortar"
+                className="playhead-drag-handle"
+                title="Arrastra para mover el playhead"
+                aria-label="Mover el playhead"
                 onPointerDown={beginPlayheadDrag}
                 onPointerMove={updatePlayheadDrag}
                 onPointerUp={endPlayheadDrag}
                 onPointerCancel={endPlayheadDrag}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  if (suppressPlayheadClickRef.current) {
-                    suppressPlayheadClickRef.current = false;
-                    return;
-                  }
-                  if (splittableClipIds.length) props.onSplitAtPlayhead(playhead, selectedClipIds);
-                }}
+                onClick={(event) => event.stopPropagation()}
               >
-                <Scissors size={12} />
+                <ChevronDown size={14} strokeWidth={3} />
               </button>
             </div>
             {visibleSnapTime !== undefined ? <div className="timeline-snap-guide ruler" style={{ left: `${(visibleSnapTime / Math.max(1, timelineDisplayDuration)) * 100}%` }} /> : null}
@@ -2349,6 +2416,17 @@ function EditorView(props: {
           ))}
           {timelineSelectionBox ? <div className="timeline-selection-box" style={timelineSelectionBox} /> : null}
         </div>
+        <button
+          className={`timeline-floating-cut ${splittableClipIds.length ? '' : 'disabled'}`}
+          style={{ left: 106 + (playhead / Math.max(1, timelineDisplayDuration)) * timelineContentWidth - timelineOffset }}
+          title={selectedClipIds.length ? 'Cortar seleccion (Ctrl+B)' : 'Cortar todas las capas (Ctrl+B)'}
+          aria-label="Cortar en el playhead"
+          disabled={!splittableClipIds.length}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={() => props.onSplitAtPlayhead(playhead, selectedClipIds)}
+        >
+          <Scissors size={15} />
+        </button>
       </section>
 
       <input
