@@ -25,7 +25,7 @@ import {
   User,
   Video
 } from 'lucide-react';
-import { ChangeEvent, CSSProperties, DragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChangeEvent, CSSProperties, DragEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createDriveClient } from './drive';
 import { DRIVE_SYNC_DEBOUNCE_MS, PROJECT_APP_PROPERTY, PROJECT_FILE_NAME, PROJECT_FOLDER_PROPERTY } from './constants';
 import { loadStoredState, persistStoredState } from './storage';
@@ -1384,6 +1384,7 @@ function EditorView(props: {
   const appliedFocusRef = useRef<string | undefined>(undefined);
   const tracksRef = useRef<HTMLDivElement>(null);
   const timelineRulerRef = useRef<HTMLDivElement>(null);
+  const timelinePanelRef = useRef<HTMLElement>(null);
   const panelResizeRef = useRef<{
     pointerId: number;
     type: 'assets' | 'inspector' | 'timeline';
@@ -1713,7 +1714,8 @@ function EditorView(props: {
     setTimelineOffset((current) => clamp(current, 0, maxOffset));
   }, [timelineContentWidth, timelineViewportWidth]);
 
-  const handleTimelineWheel = (event: ReactWheelEvent<HTMLElement>) => {
+  const handleTimelineWheel = (event: WheelEvent) => {
+    if (!(event.target instanceof Element) || !event.target.closest('.timeline-ruler, .tracks')) return;
     event.preventDefault();
     const horizontalGesture = Math.abs(event.deltaX) > Math.abs(event.deltaY) || event.shiftKey;
     if (horizontalGesture && timelineZoom > 1) {
@@ -1733,6 +1735,14 @@ function EditorView(props: {
     setTimelineZoom(nextZoom);
     setTimelineOffset(clamp(timeAtCursor * nextPixelsPerSecond - cursorX, 0, nextMaxOffset));
   };
+
+  useEffect(() => {
+    const panel = timelinePanelRef.current;
+    if (!panel) return;
+    const onWheel = (event: WheelEvent) => handleTimelineWheel(event);
+    panel.addEventListener('wheel', onWheel, { passive: false });
+    return () => panel.removeEventListener('wheel', onWheel);
+  }, [timelineContentWidth, timelineOffset, timelinePixelsPerSecond, timelineViewportWidth, timelineZoom, props.project.duration]);
 
   const beginPanelResize = (event: ReactPointerEvent<HTMLElement>, type: 'assets' | 'inspector' | 'timeline') => {
     event.preventDefault();
@@ -2120,7 +2130,7 @@ function EditorView(props: {
         onPointerCancel={endPanelResize}
       />
 
-      <section className="timeline-panel">
+      <section className="timeline-panel" ref={timelinePanelRef}>
         <div className="timeline-toolbar">
           <div className="timeline-actions">
             <button
@@ -2143,7 +2153,6 @@ function EditorView(props: {
           style={{ marginRight: timelineScrollbarWidth }}
           onPointerDown={beginScrub}
           onPointerMove={continueScrub}
-          onWheel={handleTimelineWheel}
         >
           <div className="timeline-ruler-content" style={{ width: timelineContentWidth, transform: `translateX(${-timelineOffset}px)` }}>
             {Array.from({ length: Math.ceil(timelineDisplayDuration / timelineTickStep) + 1 }).map((_, index) => {
@@ -2154,7 +2163,7 @@ function EditorView(props: {
             {visibleSnapTime !== undefined ? <div className="timeline-snap-guide ruler" style={{ left: `${(visibleSnapTime / Math.max(1, timelineDisplayDuration)) * 100}%` }} /> : null}
           </div>
         </div>
-        <div className="tracks" ref={tracksRef} onWheel={handleTimelineWheel}>
+        <div className="tracks" ref={tracksRef}>
           {timelineTracksForRender.map((track) => (
             <div className={`track-row ${track.virtual ? 'virtual' : ''}`} key={track.id}>
               <div className="track-label">{track.name}</div>
