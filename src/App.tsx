@@ -8,9 +8,11 @@ import {
   FolderInput,
   FolderPlus,
   Fullscreen,
+  Grid2X2,
   Home,
   Image as ImageIcon,
   Loader2,
+  List,
   MoreVertical,
   Music,
   Pause,
@@ -57,6 +59,14 @@ function getInitialTheme(): ThemeMode {
     // Use the system preference when storage is unavailable.
   }
   return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function getDefaultSidePanelWidth() {
+  return clamp(window.innerWidth * 0.22, 260, 470);
+}
+
+function getDefaultTimelineHeight() {
+  return clamp((window.innerHeight - 64) * 0.34, 190, 430);
 }
 
 type DiffusionCore = typeof import('@diffusionstudio/core');
@@ -1429,9 +1439,16 @@ function EditorView(props: {
   const [assetFolderName, setAssetFolderName] = useState('');
   const [movingAssetId, setMovingAssetId] = useState<string | undefined>();
   const [showAssetBin, setShowAssetBin] = useState(false);
-  const [assetPanelWidth, setAssetPanelWidth] = useState(268);
-  const [inspectorPanelWidth, setInspectorPanelWidth] = useState(286);
-  const [timelineHeight, setTimelineHeight] = useState(212);
+  const [assetPanelWidth, setAssetPanelWidth] = useState(getDefaultSidePanelWidth);
+  const [inspectorPanelWidth, setInspectorPanelWidth] = useState(getDefaultSidePanelWidth);
+  const [timelineHeight, setTimelineHeight] = useState(getDefaultTimelineHeight);
+  const [assetViewMode, setAssetViewMode] = useState<'grid' | 'list'>(() => {
+    try {
+      return localStorage.getItem('inhouse-vidmaker-asset-view') === 'list' ? 'list' : 'grid';
+    } catch {
+      return 'grid';
+    }
+  });
   const [timelineZoom, setTimelineZoom] = useState(1);
   const [timelineOffset, setTimelineOffset] = useState(0);
   const [timelineViewportWidth, setTimelineViewportWidth] = useState(1);
@@ -1860,6 +1877,14 @@ function EditorView(props: {
   }, [props.project.tracks.length]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem('inhouse-vidmaker-asset-view', assetViewMode);
+    } catch {
+      // Keep the selected view for the current session.
+    }
+  }, [assetViewMode]);
+
+  useEffect(() => {
     const ruler = timelineRulerRef.current;
     if (!ruler) return;
     const updateWidth = () => setTimelineViewportWidth(Math.max(1, ruler.clientWidth));
@@ -1921,9 +1946,9 @@ function EditorView(props: {
   const updatePanelResize = (event: ReactPointerEvent<HTMLElement>) => {
     const gesture = panelResizeRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) return;
-    const minimumPreviewWidth = 320;
-    const maximumAssetWidth = Math.max(180, Math.min(440, window.innerWidth - inspectorPanelWidth - minimumPreviewWidth - 12));
-    const maximumInspectorWidth = Math.max(220, Math.min(440, window.innerWidth - assetPanelWidth - minimumPreviewWidth - 12));
+    const minimumPreviewWidth = 360;
+    const maximumAssetWidth = Math.max(180, Math.min(520, window.innerWidth - inspectorPanelWidth - minimumPreviewWidth - 12));
+    const maximumInspectorWidth = Math.max(220, Math.min(520, window.innerWidth - assetPanelWidth - minimumPreviewWidth - 12));
     const maximumTimelineHeight = Math.max(220, window.innerHeight - 56 - 220 - 6);
     if (gesture.type === 'assets') setAssetPanelWidth(clamp(gesture.assetWidth + event.clientX - gesture.startX, 180, maximumAssetWidth));
     if (gesture.type === 'inspector') setInspectorPanelWidth(clamp(gesture.inspectorWidth - event.clientX + gesture.startX, 220, maximumInspectorWidth));
@@ -2060,6 +2085,10 @@ function EditorView(props: {
               <span className="panel-subtitle">{visibleAssets.length} archivos</span>
             </div>
             <div className="asset-panel-actions">
+              <div className="asset-view-toggle" aria-label="Vista de assets">
+                <button className={assetViewMode === 'grid' ? 'active' : ''} title="Cuadricula" aria-label="Vista de cuadricula" onClick={() => setAssetViewMode('grid')}><Grid2X2 size={15} /></button>
+                <button className={assetViewMode === 'list' ? 'active' : ''} title="Lista" aria-label="Vista de lista" onClick={() => setAssetViewMode('list')}><List size={16} /></button>
+              </div>
               {!showAssetBin ? <button className="btn btn-secondary btn-icon-square" title="Nueva carpeta" onClick={() => setCreatingAssetFolder(true)}><FolderPlus size={17} /></button> : null}
               <button className={`btn btn-secondary btn-icon-square ${showAssetBin ? 'active' : ''}`} title={showAssetBin ? 'Volver a assets' : 'Papelera'} onClick={() => { setShowAssetBin((value) => !value); setMovingAssetId(undefined); }}>
                 {showAssetBin ? <ArrowLeft size={17} /> : <Trash2 size={17} />}
@@ -2085,10 +2114,10 @@ function EditorView(props: {
               <button className="btn btn-secondary btn-icon-square" type="button" onClick={() => setCreatingAssetFolder(false)}>×</button>
             </form>
           ) : null}
-          <div className="asset-list">
+          <div className={`asset-list ${assetViewMode}`}>
             {visibleAssetFolders.map((folder) => (
               <button className="asset-folder-row" key={folder.id} onClick={() => setAssetFolderId(folder.id)}>
-                <Folder size={19} /><strong>{folder.name}</strong><ChevronRight size={16} />
+                <span className="asset-folder-preview"><Folder size={26} /></span><strong>{folder.name}</strong><ChevronRight size={16} />
               </button>
             ))}
             {visibleAssets.map((asset) => (
@@ -2107,7 +2136,12 @@ function EditorView(props: {
                   onDoubleClick={() => props.onPlaceAsset(asset.id, playhead)}
                   title="Arrastra a la timeline o haz doble clic"
                 >
-                  {asset.kind === 'video' ? <Video size={18} /> : asset.kind === 'audio' ? <Music size={18} /> : <ImageIcon size={18} />}
+                  <span className={`asset-thumbnail ${asset.kind}`}>
+                    {asset.objectUrl && asset.kind === 'image' ? <img src={asset.objectUrl} alt="" draggable={false} /> : null}
+                    {asset.objectUrl && asset.kind === 'video' ? <video src={asset.objectUrl} muted playsInline preload="metadata" draggable={false} onLoadedMetadata={(event) => { if (event.currentTarget.duration > 0) event.currentTarget.currentTime = Math.min(0.1, event.currentTarget.duration / 2); }} /> : null}
+                    {asset.kind === 'audio' ? <Music size={28} /> : null}
+                    {!asset.objectUrl && asset.kind !== 'audio' ? (asset.kind === 'video' ? <Video size={28} /> : <ImageIcon size={28} />) : null}
+                  </span>
                   <span className="asset-copy"><strong>{asset.name}</strong><span>{formatBytes(asset.size)} - {asset.uploadState}</span></span>
                 </button>
                 <div className="asset-row-actions">
@@ -2138,7 +2172,7 @@ function EditorView(props: {
           role="separator"
           aria-label="Cambiar ancho de assets"
           aria-orientation="vertical"
-          onDoubleClick={() => setAssetPanelWidth(268)}
+          onDoubleClick={() => setAssetPanelWidth(getDefaultSidePanelWidth())}
           onPointerDown={(event) => beginPanelResize(event, 'assets')}
           onPointerMove={updatePanelResize}
           onPointerUp={endPanelResize}
@@ -2249,7 +2283,7 @@ function EditorView(props: {
           role="separator"
           aria-label="Cambiar ancho del inspector"
           aria-orientation="vertical"
-          onDoubleClick={() => setInspectorPanelWidth(286)}
+          onDoubleClick={() => setInspectorPanelWidth(getDefaultSidePanelWidth())}
           onPointerDown={(event) => beginPanelResize(event, 'inspector')}
           onPointerMove={updatePanelResize}
           onPointerUp={endPanelResize}
@@ -2302,7 +2336,7 @@ function EditorView(props: {
         role="separator"
         aria-label="Cambiar altura de la timeline"
         aria-orientation="horizontal"
-        onDoubleClick={() => setTimelineHeight(212)}
+        onDoubleClick={() => setTimelineHeight(getDefaultTimelineHeight())}
         onPointerDown={(event) => beginPanelResize(event, 'timeline')}
         onPointerMove={updatePanelResize}
         onPointerUp={endPanelResize}
@@ -2418,7 +2452,7 @@ function EditorView(props: {
         </div>
         <button
           className={`timeline-floating-cut ${splittableClipIds.length ? '' : 'disabled'}`}
-          style={{ left: 106 + (playhead / Math.max(1, timelineDisplayDuration)) * timelineContentWidth - timelineOffset }}
+          style={{ left: 102 + (playhead / Math.max(1, timelineDisplayDuration)) * timelineContentWidth - timelineOffset }}
           title={selectedClipIds.length ? 'Cortar seleccion (Ctrl+B)' : 'Cortar todas las capas (Ctrl+B)'}
           aria-label="Cortar en el playhead"
           disabled={!splittableClipIds.length}

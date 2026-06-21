@@ -1247,7 +1247,7 @@ button {
 .asset-panel,
 .inspector-panel {
   background: rgba(255, 255, 255, 0.72);
-  padding: 18px 16px;
+  padding: 12px;
   overflow: auto;
   height: 100%;
 }
@@ -1265,7 +1265,7 @@ button {
   justify-content: space-between;
   align-items: center;
   gap: 10px;
-  margin-bottom: 16px;
+  margin-bottom: 12px;
 }
 
 .panel-head h2 {
@@ -1290,9 +1290,37 @@ button {
   gap: 4px;
 }
 
+.asset-panel-actions .btn-icon-square {
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+}
+
 .asset-panel-actions .active {
   color: var(--accent-orange);
   background: rgba(224, 122, 60, 0.1);
+}
+
+.asset-view-toggle {
+  display: inline-flex;
+  padding: 2px;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.045);
+}
+
+.asset-view-toggle button {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  color: var(--text-secondary);
+}
+
+.asset-view-toggle button.active {
+  background: var(--bg-secondary);
+  color: var(--accent-orange);
+  box-shadow: var(--shadow-soft);
 }
 
 .asset-breadcrumbs {
@@ -1358,7 +1386,7 @@ button {
 .asset-list {
   display: grid;
   gap: 0;
-  margin-top: 18px;
+  margin-top: 12px;
   border-top: 1px solid var(--border-soft);
 }
 
@@ -1383,11 +1411,37 @@ button {
 .asset-open-button {
   min-width: 0;
   display: grid;
-  grid-template-columns: 26px minmax(0, 1fr);
+  grid-template-columns: 64px minmax(0, 1fr);
   gap: 8px;
   align-items: center;
   padding: 0;
   text-align: left;
+}
+
+.asset-thumbnail,
+.asset-folder-preview {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  display: grid !important;
+  place-items: center;
+  overflow: hidden !important;
+  border-radius: 6px;
+  background: #111;
+  color: var(--accent-orange) !important;
+}
+
+.asset-thumbnail img,
+.asset-thumbnail video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+  background: #111;
+  pointer-events: none;
+}
+
+.asset-folder-preview {
+  background: rgba(224, 122, 60, 0.09);
 }
 
 .asset-copy {
@@ -1412,12 +1466,85 @@ button {
   width: 100%;
   min-height: 48px;
   display: grid;
-  grid-template-columns: 26px minmax(0, 1fr) 18px;
+  grid-template-columns: 64px minmax(0, 1fr) 18px;
   gap: 8px;
   align-items: center;
   padding: 8px 0;
   border-bottom: 1px solid var(--border-soft);
   text-align: left;
+}
+
+.asset-list.grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  border-top: 0;
+}
+
+.asset-list.grid .asset-row,
+.asset-list.grid .asset-folder-row {
+  position: relative;
+  min-height: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  padding: 0;
+  overflow: hidden;
+  background: var(--bg-secondary);
+}
+
+.asset-list.grid .asset-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  align-content: start;
+}
+
+.asset-list.grid .asset-open-button {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 7px;
+  padding: 0 0 9px;
+}
+
+.asset-list.grid .asset-thumbnail,
+.asset-list.grid .asset-folder-preview {
+  border-radius: 0;
+}
+
+.asset-list.grid .asset-copy {
+  padding: 0 9px;
+}
+
+.asset-list.grid .asset-row-actions {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  padding: 2px;
+  border-radius: 7px;
+  background: rgba(20, 20, 20, 0.72);
+  backdrop-filter: blur(8px);
+}
+
+.asset-list.grid .asset-row-actions button {
+  color: #fff;
+}
+
+.asset-list.grid .asset-folder-row {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 7px;
+  align-content: start;
+  padding-bottom: 9px;
+}
+
+.asset-list.grid .asset-folder-row strong {
+  padding: 0 9px;
+}
+
+.asset-list.grid .asset-folder-row > svg:last-child {
+  display: none;
+}
+
+.asset-list.grid .asset-move-menu {
+  margin: 0 7px 7px;
 }
 
 .asset-folder-row svg:first-child {
@@ -1787,7 +1914,7 @@ button {
 .timeline-panel {
   position: relative;
   margin: 0;
-  padding: 10px 14px 14px;
+  padding: 8px 10px 10px;
   background: rgba(255, 255, 255, 0.84);
   display: grid;
   grid-template-rows: 38px 24px 1fr;
