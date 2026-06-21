@@ -1,9 +1,9 @@
 import {
   ArrowLeft,
+  ChevronRight,
   Download,
   Film,
   Folder,
-  FolderPlus,
   Fullscreen,
   Home,
   Image as ImageIcon,
@@ -14,6 +14,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  RotateCcw,
   Scissors,
   Search,
   Trash2,
@@ -22,11 +23,11 @@ import {
   User,
   Video
 } from 'lucide-react';
-import { ChangeEvent, DragEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChangeEvent, DragEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createDriveClient } from './drive';
 import { DRIVE_SYNC_DEBOUNCE_MS, PROJECT_APP_PROPERTY, PROJECT_FILE_NAME, PROJECT_FOLDER_PROPERTY } from './constants';
 import { loadStoredState, persistStoredState } from './storage';
-import type { AssetRecord, DriveClient, DriveFolder, FolderPickerResult, ProjectRecord, SaveStatus, TimelineItem } from './types';
+import type { AssetRecord, DriveClient, DriveFolder, DriveProjectFile, FolderPickerResult, ProjectRecord, SaveStatus, TimelineItem } from './types';
 import {
   assetKindFromFile,
   clamp,
@@ -43,6 +44,14 @@ import {
 const drive = createDriveClient();
 
 type DiffusionCore = typeof import('@diffusionstudio/core');
+
+type BinEntry = {
+  id: string;
+  name: string;
+  modifiedTime?: string;
+  driveId?: string;
+  projectId?: string;
+};
 
 function RoofLogo() {
   return (
@@ -80,6 +89,8 @@ export function App() {
   const [currentFolder, setCurrentFolder] = useState<DriveFolder>({ id: 'root', name: 'Mi unidad' });
   const [driveFolders, setDriveFolders] = useState<DriveFolder[]>([]);
   const [foldersLoading, setFoldersLoading] = useState(false);
+  const [trashTarget, setTrashTarget] = useState<ProjectRecord | null>(null);
+  const [isBinOpen, setBinOpen] = useState(false);
   const [toast, setToast] = useState('');
   const [isDragging, setDragging] = useState(false);
   const syncTimerRef = useRef<number | null>(null);
@@ -94,8 +105,9 @@ export function App() {
 
   const visibleProjects = useMemo(() => {
     const term = search.trim().toLowerCase();
-    if (!term) return projects;
-    return projects.filter((project) => project.name.toLowerCase().includes(term));
+    const activeProjects = projects.filter((project) => !project.trashedAt);
+    if (!term) return activeProjects;
+    return activeProjects.filter((project) => project.name.toLowerCase().includes(term));
   }, [projects, search]);
 
   const homeFolders = useMemo(() => {
@@ -235,7 +247,7 @@ export function App() {
       const files = await drive.listProjects();
       const loaded = await Promise.all(files.map(async (file) => {
         const project = normalizeLoadedProject(await drive.downloadJson<ProjectRecord>(file.id));
-        return { ...project, projectFileId: file.id, updatedAt: project.updatedAt || file.modifiedTime || nowIso() };
+        return { ...project, projectFileId: file.id, trashedAt: undefined, updatedAt: project.updatedAt || file.modifiedTime || nowIso() };
       }));
       setProjects((current) => {
         const byId = new Map(current.map((project) => [project.id, project]));
@@ -306,9 +318,50 @@ export function App() {
     updateProjects((current) => [duplicate, ...current]);
   }
 
-  function deleteProject(projectId: string) {
-    updateProjects((current) => current.filter((project) => project.id !== projectId));
-    if (activeProjectId === projectId) setActiveProjectId(undefined);
+  async function moveProjectToTrash(project: ProjectRecord) {
+    setTrashTarget(null);
+    try {
+      setSaveStatus('saving');
+      if (project.folderId && drive.accessToken) {
+        await drive.trashFile(project.folderId);
+      }
+      setProjects((current) => {
+        const next = current.map((item) => item.id === project.id ? { ...item, trashedAt: nowIso() } : item);
+        persistStoredState(next, activeProjectId === project.id ? undefined : activeProjectId);
+        return next;
+      });
+      if (activeProjectId === project.id) setActiveProjectId(undefined);
+      setSaveStatus('saved');
+      setToast('Moved to bin');
+    } catch (error) {
+      setSaveStatus('error');
+      setToast(error instanceof Error ? error.message : 'No se pudo mover el proyecto a la papelera.');
+    }
+  }
+
+  async function restoreProject(entry: BinEntry) {
+    try {
+      setSaveStatus('saving');
+      if (entry.driveId && drive.accessToken) {
+        await drive.restoreFile(entry.driveId);
+      }
+      setProjects((current) => {
+        const next = current.map((project) => {
+          const matchesProject = entry.projectId && project.id === entry.projectId;
+          const matchesFolder = entry.driveId && project.folderId === entry.driveId;
+          return matchesProject || matchesFolder ? { ...project, trashedAt: undefined } : project;
+        });
+        persistStoredState(next, activeProjectId);
+        return next;
+      });
+      if (entry.driveId) await refreshDriveProjects();
+      setSaveStatus('saved');
+      setToast('Restored');
+    } catch (error) {
+      setSaveStatus('error');
+      setToast(error instanceof Error ? error.message : 'No se pudo restaurar el proyecto.');
+      throw error;
+    }
   }
 
   async function addFiles(files: FileList | File[]) {
@@ -512,7 +565,6 @@ export function App() {
         projects={visibleProjects}
         folders={homeFolders}
         search={search}
-        saveStatus={saveStatus}
         currentFolder={currentFolder}
         foldersLoading={foldersLoading}
         onSearch={setSearch}
@@ -528,7 +580,8 @@ export function App() {
         }}
         onOpenProject={setActiveProjectId}
         onDuplicateProject={duplicateProject}
-        onDeleteProject={deleteProject}
+        onDeleteProject={(project) => setTrashTarget(project)}
+        onOpenBin={() => setBinOpen(true)}
         onSelectFolder={(folder) => {
           setCurrentFolder(folder);
           void loadDriveFolders(folder.id);
@@ -555,6 +608,20 @@ export function App() {
           void createProject(result);
         }}
       />
+      <TrashConfirmModal
+        project={trashTarget}
+        onCancel={() => setTrashTarget(null)}
+        onConfirm={() => {
+          if (trashTarget) void moveProjectToTrash(trashTarget);
+        }}
+      />
+      <DriveBinModal
+        open={isBinOpen}
+        drive={drive}
+        localProjects={projects.filter((project) => project.trashedAt)}
+        onClose={() => setBinOpen(false)}
+        onRestore={restoreProject}
+      />
       {isDragging ? <div className="drop-hint"><Upload size={22} /> Suelta archivos para subirlos al proyecto abierto</div> : null}
       {toast ? <Toast text={toast} onDone={() => setToast('')} /> : null}
     </main>
@@ -567,7 +634,6 @@ function DriveHome(props: {
   projects: ProjectRecord[];
   folders: DriveFolder[];
   search: string;
-  saveStatus: SaveStatus;
   currentFolder: DriveFolder;
   foldersLoading: boolean;
   onSearch(value: string): void;
@@ -577,7 +643,8 @@ function DriveHome(props: {
   onCreateProject(): void;
   onOpenProject(id: string): void;
   onDuplicateProject(project: ProjectRecord): void;
-  onDeleteProject(id: string): void;
+  onDeleteProject(project: ProjectRecord): void;
+  onOpenBin(): void;
   onSelectFolder(folder: DriveFolder): void;
 }) {
   const [profileOpen, setProfileOpen] = useState(false);
@@ -594,8 +661,8 @@ function DriveHome(props: {
           <button className="btn btn-secondary btn-icon-square" title="Pantalla completa" onClick={() => document.documentElement.requestFullscreen?.()}>
             <Fullscreen size={18} />
           </button>
-          <button className="btn btn-primary" onClick={props.onCreateProject}>
-            <Plus size={16} /> Nuevo proyecto
+          <button className="btn btn-primary drive-new-project" onClick={props.onCreateProject}>
+            <Plus size={16} /> <span>Nuevo proyecto</span>
           </button>
           <button className="btn btn-secondary btn-icon-square" title="Actualizar" onClick={props.onRefresh}>
             <RefreshCw size={17} />
@@ -628,6 +695,9 @@ function DriveHome(props: {
 
       <div className="drive-main">
         <div className="drive-toolbar">
+          <button className="btn btn-secondary btn-icon-square" title="Bin" aria-label="Bin" onClick={props.onOpenBin}>
+            <Trash2 size={18} />
+          </button>
           <div className="drive-search-wrap">
             <Search size={17} />
             <input
@@ -637,7 +707,6 @@ function DriveHome(props: {
               placeholder="Buscar proyectos o carpetas..."
             />
           </div>
-          <span className={`save-pill ${props.saveStatus}`}>{statusCopy(props.saveStatus)}</span>
         </div>
 
         <div className="drive-breadcrumbs">
@@ -659,10 +728,6 @@ function DriveHome(props: {
                 <div className="drive-card-title">{folder.name}</div>
               </button>
             ))}
-            <button className="drive-folder-card muted" onClick={props.onCreateProject}>
-              <FolderPlus className="drive-folder-icon" />
-              <div className="drive-card-title">Nuevo proyecto</div>
-            </button>
           </div>
           {!props.foldersLoading && !props.folders.length ? (
             <div className="drive-empty folder-empty">No hay carpetas en esta ubicacion.</div>
@@ -681,7 +746,7 @@ function DriveHome(props: {
                 compact
                 onOpen={() => props.onOpenProject(project.id)}
                 onDuplicate={() => props.onDuplicateProject(project)}
-                onDelete={() => props.onDeleteProject(project.id)}
+                onDelete={() => props.onDeleteProject(project)}
               />
             ))}
           </div>
@@ -699,7 +764,7 @@ function DriveHome(props: {
                 project={project}
                 onOpen={() => props.onOpenProject(project.id)}
                 onDuplicate={() => props.onDuplicateProject(project)}
-                onDelete={() => props.onDeleteProject(project.id)}
+                onDelete={() => props.onDeleteProject(project)}
               />
             ))}
           </div>
@@ -776,10 +841,213 @@ function ProjectCard(props: {
         <div className={`drive-card-dropdown ${open ? '' : 'hidden'}`}>
           <button onClick={props.onOpen}><Home size={15} /> Abrir</button>
           <button onClick={props.onDuplicate}><Plus size={15} /> Duplicar</button>
-          <button className="danger" onClick={props.onDelete}><Trash2 size={15} /> Eliminar local</button>
+          <button className="danger" onClick={props.onDelete}><Trash2 size={15} /> Move to bin</button>
         </div>
       </div>
     </article>
+  );
+}
+
+function TrashConfirmModal(props: {
+  project: ProjectRecord | null;
+  onCancel(): void;
+  onConfirm(): void;
+}) {
+  const sliderRef = useRef<HTMLDivElement | null>(null);
+  const handleRef = useRef<HTMLDivElement | null>(null);
+  const positionRef = useRef(0);
+  const maxRef = useRef(0);
+  const dragOffsetRef = useRef(0);
+  const draggingRef = useRef(false);
+  const [position, setPositionState] = useState(0);
+  const [dragging, setDraggingState] = useState(false);
+  const [complete, setComplete] = useState(false);
+
+  const updateMetrics = useCallback(() => {
+    const slider = sliderRef.current;
+    const handle = handleRef.current;
+    if (!slider || !handle) return 0;
+    const sliderRect = slider.getBoundingClientRect();
+    const handleWidth = handle.getBoundingClientRect().width || 44;
+    maxRef.current = Math.max(0, sliderRect.width - handleWidth - 8);
+    return maxRef.current;
+  }, []);
+
+  const setPosition = useCallback((next: number) => {
+    const max = updateMetrics();
+    const clamped = Math.max(0, Math.min(next, max));
+    positionRef.current = clamped;
+    setPositionState(clamped);
+  }, [updateMetrics]);
+
+  useEffect(() => {
+    positionRef.current = 0;
+    draggingRef.current = false;
+    setPositionState(0);
+    setDraggingState(false);
+    setComplete(false);
+    if (props.project) requestAnimationFrame(updateMetrics);
+  }, [props.project, updateMetrics]);
+
+  function startDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    const slider = sliderRef.current;
+    const handle = handleRef.current;
+    if (!slider || !handle) return;
+    draggingRef.current = true;
+    setDraggingState(true);
+    setComplete(false);
+    slider.setPointerCapture(event.pointerId);
+    const sliderRect = slider.getBoundingClientRect();
+    const handleRect = handle.getBoundingClientRect();
+    dragOffsetRef.current = Math.max(0, Math.min(event.clientX - handleRect.left, handleRect.width));
+    setPosition(event.clientX - sliderRect.left - 4 - dragOffsetRef.current);
+  }
+
+  function drag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!draggingRef.current || !sliderRef.current) return;
+    const sliderRect = sliderRef.current.getBoundingClientRect();
+    setPosition(event.clientX - sliderRect.left - 4 - dragOffsetRef.current);
+  }
+
+  function endDrag() {
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
+    setDraggingState(false);
+    const max = updateMetrics();
+    if (max > 0 && positionRef.current >= max * 0.9) {
+      setComplete(true);
+      setPosition(max);
+      window.setTimeout(props.onConfirm, 120);
+      return;
+    }
+    setPosition(0);
+  }
+
+  if (!props.project) return null;
+
+  return (
+    <div className="modal-overlay visible" onMouseDown={(event) => event.target === event.currentTarget && props.onCancel()}>
+      <div className="modal modal-danger">
+        <h2>Move to bin?</h2>
+        <p>This will move <strong>{props.project.name}</strong> to your Drive bin.</p>
+        <div
+          ref={sliderRef}
+          className={`confirm-slider ${dragging ? 'dragging' : ''} ${complete ? 'complete' : ''}`}
+          aria-label="Slide to move to bin"
+          onPointerDown={startDrag}
+          onPointerMove={drag}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+          onLostPointerCapture={endDrag}
+        >
+          <div className="confirm-slider-fill" style={{ width: position + 26 }} />
+          <div className="confirm-slider-text">Slide to move to bin</div>
+          <div ref={handleRef} className="confirm-slider-handle" style={{ transform: `translateX(${position}px)` }} aria-hidden="true">
+            <ChevronRight size={18} />
+          </div>
+        </div>
+        <div className="modal-actions">
+          <button className="btn btn-secondary" onClick={props.onCancel}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DriveBinModal(props: {
+  open: boolean;
+  drive: DriveClient;
+  localProjects: ProjectRecord[];
+  onClose(): void;
+  onRestore(entry: BinEntry): Promise<void>;
+}) {
+  const [remoteFiles, setRemoteFiles] = useState<DriveProjectFile[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [openMenuId, setOpenMenuId] = useState<string>();
+
+  const refresh = useCallback(async () => {
+    if (!props.drive.accessToken) return;
+    setLoading(true);
+    try {
+      setRemoteFiles(await props.drive.listTrash());
+    } catch {
+      setRemoteFiles([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [props.drive]);
+
+  useEffect(() => {
+    if (!props.open) return;
+    setOpenMenuId(undefined);
+    void refresh();
+  }, [props.open, refresh]);
+
+  const entries = useMemo(() => {
+    const localByFolder = new Map(props.localProjects.filter((project) => project.folderId).map((project) => [project.folderId!, project]));
+    const result: BinEntry[] = remoteFiles.map((file) => ({
+      id: `drive-${file.id}`,
+      driveId: file.id,
+      projectId: localByFolder.get(file.id)?.id,
+      name: file.name,
+      modifiedTime: file.modifiedTime || file.createdTime
+    }));
+    const remoteIds = new Set(remoteFiles.map((file) => file.id));
+    props.localProjects.forEach((project) => {
+      if (project.folderId && remoteIds.has(project.folderId)) return;
+      result.push({
+        id: `local-${project.id}`,
+        driveId: project.folderId,
+        projectId: project.id,
+        name: project.name,
+        modifiedTime: project.trashedAt || project.updatedAt
+      });
+    });
+    return result.sort((a, b) => String(b.modifiedTime || '').localeCompare(String(a.modifiedTime || '')));
+  }, [props.localProjects, remoteFiles]);
+
+  if (!props.open) return null;
+
+  return (
+    <div className="modal-overlay visible" onMouseDown={(event) => event.target === event.currentTarget && props.onClose()}>
+      <div className="modal bin-modal">
+        <h2>Bin</h2>
+        <p>Files currently in your Drive bin.</p>
+        {loading ? (
+          <div className="bin-loading"><Loader2 className="spin" size={18} /> Loading bin...</div>
+        ) : null}
+        <div className="bin-list">
+          {!loading && entries.map((entry) => (
+            <div className="bin-item" key={entry.id}>
+              <Folder size={18} />
+              <div className="bin-item-content">
+                <div className="bin-item-name">{entry.name}</div>
+                <div className="bin-item-meta">Modified {formatWhen(entry.modifiedTime || nowIso())}</div>
+              </div>
+              <div className="bin-item-menu">
+                <button className="bin-item-more" aria-label="More actions" onClick={() => setOpenMenuId(openMenuId === entry.id ? undefined : entry.id)}>
+                  <MoreVertical size={16} />
+                </button>
+                <div className={`bin-item-dropdown ${openMenuId === entry.id ? '' : 'hidden'}`}>
+                  <button onClick={async () => {
+                    setOpenMenuId(undefined);
+                    await props.onRestore(entry);
+                    await refresh();
+                  }}>
+                    <RotateCcw size={16} /> Restore
+                  </button>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+        {!loading && !entries.length ? <div className="drive-empty">Bin is empty.</div> : null}
+        <div className="modal-actions">
+          <button className="btn btn-secondary" onClick={props.onClose}>Close</button>
+        </div>
+      </div>
+    </div>
   );
 }
 

@@ -19,8 +19,10 @@ export interface DriveProjectFile {
   id: string;
   name: string;
   modifiedTime?: string;
+  createdTime?: string;
   parents?: string[];
   thumbnailLink?: string;
+  mimeType?: string;
 }
 
 export interface AssetRecord {
@@ -75,6 +77,7 @@ export interface ProjectRecord {
   assetsFolderId?: string;
   rendersFolderId?: string;
   thumbsFolderId?: string;
+  trashedAt?: string;
   createdAt: string;
   updatedAt: string;
   duration: number;
@@ -107,6 +110,9 @@ export interface DriveClient {
   listFolders(parentId?: string): Promise<DriveFolder[]>;
   createFolder(name: string, parentId?: string, appProperties?: Record<string, string>): Promise<DriveFolder>;
   listProjects(): Promise<DriveProjectFile[]>;
+  listTrash(): Promise<DriveProjectFile[]>;
+  trashFile(fileId: string): Promise<void>;
+  restoreFile(fileId: string): Promise<void>;
   downloadJson<T>(fileId: string): Promise<T>;
   uploadJson(name: string, data: unknown, parentId: string, appProperties?: Record<string, string>): Promise<DriveProjectFile>;
   patchJson(fileId: string, data: unknown, appProperties?: Record<string, string>): Promise<DriveProjectFile>;

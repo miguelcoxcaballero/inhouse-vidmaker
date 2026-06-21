@@ -3,6 +3,7 @@ import {
   GOOGLE_CLIENT_ID,
   PROJECT_APP_PROPERTY,
   PROJECT_FILE_NAME,
+  PROJECT_FOLDER_PROPERTY,
   TOKEN_STORAGE_KEY
 } from './constants';
 import type { DriveClient, DriveFolder, DriveProfile, DriveProjectFile } from './types';
@@ -236,6 +237,39 @@ export function createDriveClient(): DriveClient {
     return data.files || [];
   }
 
+  async function listTrash(): Promise<DriveProjectFile[]> {
+    const query = encodeURIComponent(
+      `trashed=true and mimeType='application/vnd.google-apps.folder' and appProperties has { key='${PROJECT_FOLDER_PROPERTY}' and value='1' }`
+    );
+    const fields = encodeURIComponent('files(id,name,modifiedTime,createdTime,mimeType,parents)');
+    const data = await driveJson<{ files: DriveProjectFile[] }>(
+      `https://www.googleapis.com/drive/v3/files?q=${query}&orderBy=modifiedTime desc&pageSize=100&fields=${fields}`,
+      {},
+      'No se pudo cargar la papelera.'
+    );
+    return data.files || [];
+  }
+
+  async function setTrashed(fileId: string, trashed: boolean): Promise<void> {
+    await driveJson<DriveProjectFile>(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=id`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trashed })
+      },
+      trashed ? 'No se pudo mover el proyecto a la papelera.' : 'No se pudo restaurar el proyecto.'
+    );
+  }
+
+  async function trashFile(fileId: string): Promise<void> {
+    await setTrashed(fileId, true);
+  }
+
+  async function restoreFile(fileId: string): Promise<void> {
+    await setTrashed(fileId, false);
+  }
+
   async function downloadJson<T>(fileId: string): Promise<T> {
     const response = await driveFetch(
       `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`,
@@ -368,6 +402,9 @@ export function createDriveClient(): DriveClient {
     listFolders,
     createFolder,
     listProjects,
+    listTrash,
+    trashFile,
+    restoreFile,
     downloadJson,
     uploadJson,
     patchJson,
