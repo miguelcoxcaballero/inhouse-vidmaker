@@ -967,7 +967,6 @@ function SignInGate(props: {
           <RoofLogo />
         </div>
         <h1>inhouse vidmaker</h1>
-        <p>Inicia sesion con Google para abrir tus proyectos, carpetas y archivos desde Drive.</p>
         <button className="google-signin-btn" onClick={props.onSignIn} disabled={signingIn}>
           {signingIn ? <Loader2 className="spin" size={18} /> : <User size={18} />}
           <span>{signingIn ? 'Conectando...' : 'Sign in with Google'}</span>
