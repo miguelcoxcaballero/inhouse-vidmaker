@@ -73,6 +73,11 @@ button {
   animation: spin 0.8s linear infinite;
 }
 
+.history-controls {
+  display: flex;
+  gap: 4px;
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);

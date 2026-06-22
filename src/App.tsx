@@ -24,11 +24,14 @@ import {
   Search,
   Trash2,
   Type,
+  Undo2,
   Upload,
   User,
-  Video
+  Video,
+  Redo2
 } from 'lucide-react';
 import { ChangeEvent, CSSProperties, DragEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { AudioSource, ImageSource, VideoSource } from '@diffusionstudio/core';
 import { createDriveClient } from './drive';
 import { DRIVE_SYNC_DEBOUNCE_MS, PROJECT_APP_PROPERTY, PROJECT_FILE_NAME, PROJECT_FOLDER_PROPERTY } from './constants';
 import { loadStoredState, persistStoredState } from './storage';
@@ -88,6 +91,12 @@ type TimelineDragPreview = {
   requestedTrackId: string;
   resolvedTrackId?: string;
   snapTime?: number;
+  group?: Array<{ id: string; start: number; duration: number; trackId: string; kind: TimelineItem['type'] }>;
+};
+
+type HistoryTransaction = {
+  snapshot: ProjectRecord;
+  dirty: boolean;
 };
 
 function RoofLogo() {
@@ -157,15 +166,22 @@ export function App() {
   const [toast, setToast] = useState('');
   const [isDragging, setDragging] = useState(false);
   const [focusedClipId, setFocusedClipId] = useState<string | undefined>();
+  const [historyVersion, setHistoryVersion] = useState(0);
+  const [exportProgress, setExportProgress] = useState<number | null>(null);
   const syncTimerRef = useRef<number | null>(null);
   const syncPromiseRef = useRef<Promise<void> | null>(null);
   const syncQueuedRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const undoStackRef = useRef<ProjectRecord[]>([]);
+  const redoStackRef = useRef<ProjectRecord[]>([]);
+  const historyTransactionRef = useRef<HistoryTransaction | null>(null);
+  const activeProjectRef = useRef<ProjectRecord | undefined>(undefined);
 
   const activeProject = useMemo(
     () => projects.find((project) => project.id === activeProjectId),
     [activeProjectId, projects]
   );
+  activeProjectRef.current = activeProject;
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -234,17 +250,84 @@ export function App() {
     });
   }, [activeProjectId]);
 
-  const patchActiveProject = useCallback((updater: (project: ProjectRecord) => ProjectRecord) => {
+  const patchActiveProject = useCallback((updater: (project: ProjectRecord) => ProjectRecord, recordHistory = true) => {
+    const historyProject = activeProjectRef.current;
+    if (recordHistory && historyProject) {
+      if (historyTransactionRef.current) {
+        historyTransactionRef.current.dirty = true;
+      } else {
+        undoStackRef.current = [...undoStackRef.current.slice(-99), structuredClone(historyProject)];
+        redoStackRef.current = [];
+      }
+    }
     setProjects((current) => {
       const next = current.map((project) => {
         if (project.id !== activeProjectId) return project;
-        return normalizeLoadedProject({ ...updater(project), updatedAt: nowIso() });
+        const updated = updater(project);
+        if (updated === project) return project;
+        return normalizeLoadedProject({ ...updated, updatedAt: nowIso() });
       });
       persistStoredState(next, activeProjectId);
+      activeProjectRef.current = next.find((project) => project.id === activeProjectId);
+      setSaveStatus('local');
+      return next;
+    });
+    if (recordHistory) setHistoryVersion((version) => version + 1);
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    undoStackRef.current = [];
+    redoStackRef.current = [];
+    historyTransactionRef.current = null;
+    setHistoryVersion((version) => version + 1);
+  }, [activeProjectId]);
+
+  const beginHistoryTransaction = useCallback(() => {
+    const project = activeProjectRef.current;
+    if (!project || historyTransactionRef.current) return;
+    historyTransactionRef.current = { snapshot: structuredClone(project), dirty: false };
+  }, []);
+
+  const endHistoryTransaction = useCallback(() => {
+    const transaction = historyTransactionRef.current;
+    historyTransactionRef.current = null;
+    if (!transaction?.dirty) return;
+    undoStackRef.current = [...undoStackRef.current.slice(-99), transaction.snapshot];
+    redoStackRef.current = [];
+    setHistoryVersion((version) => version + 1);
+  }, []);
+
+  const applyHistoryProject = useCallback((project: ProjectRecord) => {
+    setProjects((current) => {
+      const next = current.map((item) => item.id === project.id
+        ? normalizeLoadedProject({ ...structuredClone(project), updatedAt: nowIso() })
+        : item);
+      persistStoredState(next, activeProjectId);
+      activeProjectRef.current = next.find((item) => item.id === activeProjectId);
       setSaveStatus('local');
       return next;
     });
   }, [activeProjectId]);
+
+  const undoProject = useCallback(() => {
+    const project = activeProjectRef.current;
+    if (!project) return;
+    const previous = undoStackRef.current.pop();
+    if (!previous) return;
+    redoStackRef.current = [...redoStackRef.current.slice(-99), structuredClone(project)];
+    applyHistoryProject(previous);
+    setHistoryVersion((version) => version + 1);
+  }, [applyHistoryProject]);
+
+  const redoProject = useCallback(() => {
+    const project = activeProjectRef.current;
+    if (!project) return;
+    const next = redoStackRef.current.pop();
+    if (!next) return;
+    undoStackRef.current = [...undoStackRef.current.slice(-99), structuredClone(project)];
+    applyHistoryProject(next);
+    setHistoryVersion((version) => version + 1);
+  }, [applyHistoryProject]);
 
   const runDriveSync = useCallback(async (project: ProjectRecord) => {
     if (!drive.accessToken || !project.folderId) {
@@ -499,7 +582,7 @@ export function App() {
         patchActiveProject((project) => ({
           ...project,
           assets: project.assets.map((entry) => entry.id === asset.id ? { ...entry, ...metadata } : entry)
-        }));
+        }), false);
       });
       const uploadFolderId = destinationFolderId || activeProject.assetsFolderId;
       if (drive.accessToken && uploadFolderId) {
@@ -513,13 +596,13 @@ export function App() {
               driveFileId: uploaded.id,
               uploadState: 'uploaded'
             } : entry)
-          }));
+          }), false);
           setSaveStatus('saved');
         } catch (error) {
           patchActiveProject((project) => ({
             ...project,
             assets: project.assets.map((entry) => entry.id === asset.id ? { ...entry, uploadState: 'error' } : entry)
-          }));
+          }), false);
           setSaveStatus('error');
           setToast(error instanceof Error ? error.message : 'No se pudo subir el archivo.');
         }
@@ -561,32 +644,55 @@ export function App() {
     setFocusedClipId(clipId);
   }
 
-  function moveTimelineClip(clipId: string, start: number, requestedTrackId: string) {
+  function moveTimelineClips(moves: Array<{ clipId: string; start: number; trackId: string }>) {
+    if (!moves.length) return;
     patchActiveProject((project) => {
-      const moving = project.timeline.find((clip) => clip.id === clipId);
-      if (!moving) return project;
-      const trackKind = moving.type === 'audio' ? 'audio' : moving.type === 'text' ? 'text' : 'video';
-      const safeStart = Math.max(0, start);
-      let track = project.tracks.find((item) => item.id === requestedTrackId && item.kind === trackKind);
-      const overlaps = (trackId: string) => project.timeline.some((clip) => clip.id !== clipId && clip.trackId === trackId && timelineItemsOverlap(safeStart, moving.duration, clip));
-      if (!track || overlaps(track.id)) track = project.tracks.find((item) => item.kind === trackKind && !overlaps(item.id));
+      const movingIds = new Set(moves.map((move) => move.clipId));
+      const staticClips = project.timeline.filter((clip) => !movingIds.has(clip.id));
+      const placements = new Map<string, { start: number; trackId: string }>();
       let tracks = project.tracks;
-      if (!track) {
-        const count = project.tracks.filter((item) => item.kind === trackKind).length + 1;
-        track = { id: uid(`track_${trackKind}`), name: `${trackKind === 'text' ? 'Texto' : trackKind === 'video' ? 'Video' : 'Audio'} ${count}`, kind: trackKind, locked: false, muted: false };
-        const firstVideo = tracks.findIndex((item) => item.kind === 'video');
-        tracks = trackKind === 'video' && firstVideo >= 0
-          ? [...tracks.slice(0, firstVideo), track, ...tracks.slice(firstVideo)]
-          : [...tracks, track];
-      }
+      moves.forEach((move) => {
+        const moving = project.timeline.find((clip) => clip.id === move.clipId);
+        if (!moving) return;
+        const trackKind = moving.type === 'audio' ? 'audio' : moving.type === 'text' ? 'text' : 'video';
+        const safeStart = Math.max(0, move.start);
+        const isFree = (trackId: string) => {
+          const occupied = [
+            ...staticClips.filter((clip) => clip.trackId === trackId),
+            ...Array.from(placements.entries())
+              .map(([id, placement]) => {
+                const clip = project.timeline.find((item) => item.id === id);
+                return clip && placement.trackId === trackId ? { ...clip, start: placement.start } : undefined;
+              })
+              .filter((clip): clip is TimelineItem => !!clip)
+          ];
+          return !occupied.some((clip) => timelineItemsOverlap(safeStart, moving.duration, clip));
+        };
+        let track = tracks.find((item) => item.id === move.trackId && item.kind === trackKind && isFree(item.id));
+        if (!track) track = tracks.find((item) => item.kind === trackKind && isFree(item.id));
+        if (!track) {
+          const count = tracks.filter((item) => item.kind === trackKind).length + 1;
+          track = { id: uid(`track_${trackKind}`), name: `${trackKind === 'text' ? 'Texto' : trackKind === 'video' ? 'Video' : 'Audio'} ${count}`, kind: trackKind, locked: false, muted: false };
+          const firstMatching = tracks.findIndex((item) => item.kind === trackKind);
+          tracks = trackKind === 'audio' || firstMatching < 0
+            ? [...tracks, track]
+            : [...tracks.slice(0, firstMatching), track, ...tracks.slice(firstMatching)];
+        }
+        placements.set(moving.id, { start: safeStart, trackId: track.id });
+      });
+      if (!placements.size) return project;
+      const timeline = project.timeline.map((clip) => {
+        const placement = placements.get(clip.id);
+        return placement ? { ...clip, ...placement } : clip;
+      });
       return {
         ...project,
         tracks,
-        timeline: project.timeline.map((clip) => clip.id === clipId ? { ...clip, start: safeStart, trackId: track!.id } : clip),
-        duration: Math.max(project.duration, safeStart + moving.duration)
+        timeline,
+        duration: Math.max(project.duration, ...timeline.map((clip) => clip.start + clip.duration))
       };
     });
-    setFocusedClipId(clipId);
+    setFocusedClipId(moves[0].clipId);
   }
 
   async function createAssetFolder(name: string, parentId?: string) {
@@ -704,6 +810,18 @@ export function App() {
     });
   }
 
+  function updateClips(updates: Array<{ clipId: string; patch: Partial<TimelineItem> }>) {
+    if (!updates.length) return;
+    const patches = new Map(updates.map((update) => [update.clipId, update.patch]));
+    patchActiveProject((project) => ({
+      ...project,
+      timeline: project.timeline.map((clip) => {
+        const patch = patches.get(clip.id);
+        return patch ? { ...clip, ...patch } : clip;
+      })
+    }));
+  }
+
   function splitAtPlayhead(time: number, selectedClipIds: string[]) {
     patchActiveProject((project) => {
       const frameDuration = 1 / Math.max(1, project.fps);
@@ -730,10 +848,12 @@ export function App() {
     });
   }
 
-  function deleteClip(clipId: string) {
+  function deleteClips(clipIds: string[]) {
+    const ids = new Set(clipIds);
+    if (!ids.size) return;
     patchActiveProject((project) => ({
       ...project,
-      timeline: project.timeline.filter((clip) => clip.id !== clipId)
+      timeline: project.timeline.filter((clip) => !ids.has(clip.id))
     }));
   }
 
@@ -749,25 +869,116 @@ export function App() {
   }
 
   async function exportVideo() {
-    if (!activeProject) return;
+    if (!activeProject || exportProgress !== null) return;
     try {
-      setToast('Preparando exportacion con Diffusion Studio...');
+      const missingAssets = activeProject.timeline
+        .filter((clip) => clip.assetId)
+        .map((clip) => activeProject.assets.find((asset) => asset.id === clip.assetId))
+        .filter((asset) => !asset?.objectUrl);
+      if (missingAssets.length) throw new Error('Hay archivos de la timeline que no estan disponibles localmente. Recarga el proyecto antes de exportar.');
+      setExportProgress(0);
+      setToast('Preparando exportacion...');
       const core: DiffusionCore = await import('@diffusionstudio/core');
       const composition = new core.Composition({
         width: activeProject.width,
         height: activeProject.height,
         background: '#000000'
       });
+      const sourceCache = new Map<string, VideoSource | ImageSource | AudioSource>();
+      const getSource = async (asset: AssetRecord) => {
+        const cached = sourceCache.get(asset.id);
+        if (cached) return cached;
+        if (!asset.objectUrl) throw new Error(`No se puede cargar ${asset.name}.`);
+        let source: VideoSource | ImageSource | AudioSource;
+        if (asset.kind === 'video') source = await core.Source.from<VideoSource>(asset.objectUrl, { name: asset.name, mimeType: asset.mimeType });
+        else if (asset.kind === 'image') source = await core.Source.from<ImageSource>(asset.objectUrl, { name: asset.name, mimeType: asset.mimeType });
+        else source = await core.Source.from<AudioSource>(asset.objectUrl, { name: asset.name, mimeType: asset.mimeType });
+        sourceCache.set(asset.id, source);
+        return source;
+      };
+      const visualProps = (clip: TimelineItem, asset?: AssetRecord) => {
+        const projectRatio = activeProject.width / activeProject.height;
+        const assetRatio = asset?.width && asset.height ? asset.width / asset.height : projectRatio;
+        const width = assetRatio >= projectRatio ? activeProject.width : activeProject.height * assetRatio;
+        const height = assetRatio >= projectRatio ? activeProject.width / assetRatio : activeProject.height;
+        return {
+          delay: clip.start,
+          duration: clip.duration,
+          x: activeProject.width * (0.5 + clip.transform.x / 100),
+          y: activeProject.height * (0.5 + clip.transform.y / 100),
+          width,
+          height,
+          scale: clip.transform.scale,
+          rotation: clip.transform.rotation,
+          opacity: clip.transform.opacity / 100,
+          keepAspectRatio: true
+        };
+      };
+
+      for (const track of activeProject.tracks) {
+        const timelineClips = activeProject.timeline
+          .filter((clip) => clip.trackId === track.id)
+          .sort((a, b) => a.start - b.start);
+        if (!timelineClips.length) continue;
+        const layer = new core.Layer({ mode: 'DEFAULT' });
+        await composition.add(layer, composition.layers.length);
+        for (const clip of timelineClips) {
+          if (clip.type === 'text') {
+            await layer.add(new core.TextClip({
+              ...visualProps(clip),
+              text: clip.text || '',
+              fontSize: 64,
+              color: '#ffffff',
+              align: 'center',
+              baseline: 'middle',
+              maxWidth: activeProject.width * 0.9
+            }));
+            continue;
+          }
+          const asset = activeProject.assets.find((item) => item.id === clip.assetId);
+          if (!asset) continue;
+          const source = await getSource(asset);
+          const range: [number, number] = [clip.trimStart || 0, (clip.trimStart || 0) + clip.duration];
+          if (clip.type === 'video') {
+            await layer.add(new core.VideoClip(source as VideoSource, {
+              ...visualProps(clip, asset),
+              range,
+              muted: track.muted
+            }));
+          } else if (clip.type === 'image') {
+            await layer.add(new core.ImageClip(source as ImageSource, visualProps(clip, asset)));
+          } else {
+            await layer.add(new core.AudioClip(source as AudioSource, {
+              delay: clip.start,
+              duration: clip.duration,
+              range,
+              muted: track.muted
+            }));
+          }
+        }
+      }
       const encoder = new core.Encoder(composition, {
         video: { fps: activeProject.fps, codec: 'avc', bitrate: 8e6, resolution: 1 },
-        audio: { enabled: true, codec: 'aac', bitrate: 128e3 }
+        audio: { enabled: true, codec: 'aac', bitrate: 192e3 },
+        range: { end: activeProject.duration }
       });
+      encoder.onProgress = ({ progress, total }) => setExportProgress(total ? Math.round((progress / total) * 100) : 0);
       const renderName = `${activeProject.name.replace(/[^\w.-]+/g, '_') || 'inhouse_vidmaker'}.mp4`;
-      await encoder.render(renderName);
-      setToast('Exportacion iniciada.');
+      const result = await encoder.render();
+      if (result.type === 'error') throw result.error;
+      if (result.type !== 'success' || !result.data) throw new Error('El navegador no devolvio el archivo exportado.');
+      const url = URL.createObjectURL(result.data);
+      const download = document.createElement('a');
+      download.href = url;
+      download.download = renderName;
+      download.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      setToast('Video exportado.');
     } catch (error) {
       console.error(error);
-      setToast('Exportacion no disponible en este navegador. Prueba Chrome/Edge con WebCodecs.');
+      setToast(error instanceof Error ? error.message : 'No se pudo exportar el video. Prueba Chrome o Edge con WebCodecs.');
+    } finally {
+      setExportProgress(null);
     }
   }
 
@@ -799,14 +1010,22 @@ export function App() {
         fileInputRef={fileInputRef}
         onAddText={addTextClip}
         onPlaceAsset={placeAssetOnTimeline}
-        onMoveTimelineClip={moveTimelineClip}
+        onMoveTimelineClips={moveTimelineClips}
         onCreateAssetFolder={createAssetFolder}
         onMoveAsset={moveAsset}
         onTrashAsset={trashAsset}
         onRestoreAsset={restoreAsset}
         onUpdateClip={updateClip}
+        onUpdateClips={updateClips}
         onSplitAtPlayhead={splitAtPlayhead}
-        onDeleteClip={deleteClip}
+        onDeleteClips={deleteClips}
+        onBeginHistoryTransaction={beginHistoryTransaction}
+        onEndHistoryTransaction={endHistoryTransaction}
+        onUndo={undoProject}
+        onRedo={redoProject}
+        canUndo={historyVersion >= 0 && undoStackRef.current.length > 0}
+        canRedo={historyVersion >= 0 && redoStackRef.current.length > 0}
+        exportProgress={exportProgress}
         onExport={exportVideo}
       />
     );
@@ -1418,14 +1637,22 @@ function EditorView(props: {
   onPickFiles(): void;
   onAddText(): void;
   onPlaceAsset(assetId: string, start: number, trackId?: string): void;
-  onMoveTimelineClip(clipId: string, start: number, trackId: string): void;
+  onMoveTimelineClips(moves: Array<{ clipId: string; start: number; trackId: string }>): void;
   onCreateAssetFolder(name: string, parentId?: string): void;
   onMoveAsset(assetId: string, destinationFolderId?: string): void;
   onTrashAsset(assetId: string): void;
   onRestoreAsset(assetId: string): void;
   onUpdateClip(clipId: string, patch: Partial<TimelineItem>): void;
+  onUpdateClips(updates: Array<{ clipId: string; patch: Partial<TimelineItem> }>): void;
   onSplitAtPlayhead(time: number, selectedClipIds: string[]): void;
-  onDeleteClip(clipId: string): void;
+  onDeleteClips(clipIds: string[]): void;
+  onBeginHistoryTransaction(): void;
+  onEndHistoryTransaction(): void;
+  onUndo(): void;
+  onRedo(): void;
+  canUndo: boolean;
+  canRedo: boolean;
+  exportProgress: number | null;
   onExport(): void;
 }) {
   const [playhead, setPlayhead] = useState(0);
@@ -1458,6 +1685,7 @@ function EditorView(props: {
   const [timelineSelectionBox, setTimelineSelectionBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
   const previewCanvasRef = useRef<HTMLDivElement>(null);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
+  const audioRefs = useRef(new Map<string, HTMLAudioElement>());
   const appliedFocusRef = useRef<string | undefined>(undefined);
   const tracksRef = useRef<HTMLDivElement>(null);
   const timelineRulerRef = useRef<HTMLDivElement>(null);
@@ -1477,6 +1705,7 @@ function EditorView(props: {
     kind: TimelineItem['type'];
     duration: number;
     grabOffset: number;
+    group?: Array<{ id: string; start: number; duration: number; trackId: string; kind: TimelineItem['type'] }>;
   } | null>(null);
   const timelineDragPreviewRef = useRef<TimelineDragPreview | null>(null);
   const playheadDragRef = useRef<{ pointerId: number; startX: number } | null>(null);
@@ -1497,6 +1726,7 @@ function EditorView(props: {
     originX: number;
     originY: number;
     originScale: number;
+    groupOrigins?: Array<{ id: string; x: number; y: number }>;
     stageWidth: number;
     stageHeight: number;
   } | null>(null);
@@ -1516,8 +1746,8 @@ function EditorView(props: {
   const activeVisualClips = props.project.timeline
     .filter((clip) => clip.start <= playhead && playhead < clip.start + clip.duration && (clip.type === 'video' || clip.type === 'image'))
     .sort((a, b) => props.project.tracks.findIndex((track) => track.id === b.trackId) - props.project.tracks.findIndex((track) => track.id === a.trackId));
-  const activeAudioClip = props.project.timeline.find((clip) => clip.type === 'audio' && clip.start <= playhead && playhead < clip.start + clip.duration);
-  const activeAudioAsset = activeAudioClip?.assetId ? props.project.assets.find((asset) => asset.id === activeAudioClip.assetId) : undefined;
+  const activeAudioClips = props.project.timeline.filter((clip) => clip.type === 'audio' && clip.start <= playhead && playhead < clip.start + clip.duration);
+  const activeAudioAsset = activeAudioClips[0]?.assetId ? props.project.assets.find((asset) => asset.id === activeAudioClips[0].assetId) : undefined;
   const timelineDisplayDuration = props.project.duration / Math.min(1, timelineZoom);
   const timelineContentWidth = timelineViewportWidth * Math.max(1, timelineZoom);
   const timelinePixelsPerSecond = timelineContentWidth / Math.max(1, timelineDisplayDuration);
@@ -1562,15 +1792,29 @@ function EditorView(props: {
   }, [props.project.timeline, selectedClipId, selectedClipIds]);
 
   useEffect(() => {
-    const handleCutShortcut = (event: KeyboardEvent) => {
-      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'b') return;
+    const handleEditorShortcut = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
-      if (target?.matches('input, textarea, [contenteditable="true"]') || !splittableClipIds.length) return;
-      event.preventDefault();
-      props.onSplitAtPlayhead(playhead, selectedClipIds);
+      if (target?.matches('input, textarea, [contenteditable="true"]')) return;
+      const modifier = event.ctrlKey || event.metaKey;
+      const key = event.key.toLowerCase();
+      if (modifier && key === 'b' && splittableClipIds.length) {
+        event.preventDefault();
+        props.onSplitAtPlayhead(playhead, selectedClipIds);
+      } else if (modifier && key === 'z') {
+        event.preventDefault();
+        if (event.shiftKey) props.onRedo();
+        else props.onUndo();
+      } else if (modifier && key === 'y') {
+        event.preventDefault();
+        props.onRedo();
+      } else if ((event.key === 'Delete' || event.key === 'Backspace') && selectedClipIds.length) {
+        event.preventDefault();
+        props.onDeleteClips(selectedClipIds);
+        clearClipSelection();
+      }
     };
-    window.addEventListener('keydown', handleCutShortcut);
-    return () => window.removeEventListener('keydown', handleCutShortcut);
+    window.addEventListener('keydown', handleEditorShortcut);
+    return () => window.removeEventListener('keydown', handleEditorShortcut);
   }, [playhead, props, selectedClipIds, splittableClipIds.length]);
 
   useEffect(() => {
@@ -1578,12 +1822,22 @@ function EditorView(props: {
       if (clip.type !== 'video') return;
       const video = videoRefs.current.get(clip.id);
       if (!video) return;
+      video.muted = !!props.project.tracks.find((track) => track.id === clip.trackId)?.muted;
       const clipTime = Math.max(0, playhead - clip.start + (clip.trimStart || 0));
       if (!playing || Math.abs(video.currentTime - clipTime) > 0.25) video.currentTime = clipTime;
       if (playing) void video.play().catch(() => setPlaying(false));
       else video.pause();
     });
-  }, [playhead, playing, activeVisualClips]);
+    activeAudioClips.forEach((clip) => {
+      const audio = audioRefs.current.get(clip.id);
+      if (!audio) return;
+      audio.muted = !!props.project.tracks.find((track) => track.id === clip.trackId)?.muted;
+      const clipTime = Math.max(0, playhead - clip.start + (clip.trimStart || 0));
+      if (!playing || Math.abs(audio.currentTime - clipTime) > 0.25) audio.currentTime = clipTime;
+      if (playing) void audio.play().catch(() => setPlaying(false));
+      else audio.pause();
+    });
+  }, [playhead, playing, activeVisualClips, activeAudioClips, props.project.tracks]);
 
   const seekFromPointer = (event: ReactPointerEvent<HTMLElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -1700,25 +1954,25 @@ function EditorView(props: {
 
   const timelineTrackKind = (kind: TimelineItem['type']) => kind === 'audio' ? 'audio' : kind === 'text' ? 'text' : 'video';
 
-  const resolveTimelineTrack = (kind: TimelineItem['type'], start: number, duration: number, requestedTrackId: string, excludeClipId?: string) => {
+  const resolveTimelineTrack = (kind: TimelineItem['type'], start: number, duration: number, requestedTrackId: string, excludeClipIds = new Set<string>()) => {
     const requiredKind = timelineTrackKind(kind);
-    const isFree = (trackId: string) => !props.project.timeline.some((clip) => clip.id !== excludeClipId && clip.trackId === trackId && timelineItemsOverlap(start, duration, clip));
+    const isFree = (trackId: string) => !props.project.timeline.some((clip) => !excludeClipIds.has(clip.id) && clip.trackId === trackId && timelineItemsOverlap(start, duration, clip));
     const requested = props.project.tracks.find((track) => track.id === requestedTrackId && track.kind === requiredKind);
     if (requested && isFree(requested.id)) return requested.id;
     return props.project.tracks.find((track) => track.kind === requiredKind && isFree(track.id))?.id;
   };
 
-  const timelineSnapCandidates = (excludeClipId?: string) => [
+  const timelineSnapCandidates = (excludeClipIds = new Set<string>()) => [
     0,
     playhead,
     ...props.project.timeline
-      .filter((clip) => clip.id !== excludeClipId)
+      .filter((clip) => !excludeClipIds.has(clip.id))
       .flatMap((clip) => [clip.start, clip.start + clip.duration])
   ];
 
-  const snapTimelineStart = (rawStart: number, duration: number, excludeClipId?: string) => {
+  const snapTimelineStart = (rawStart: number, duration: number, excludeClipIds = new Set<string>()) => {
     const thresholdSeconds = clamp(10 / Math.max(0.001, timelinePixelsPerSecond), 1 / props.project.fps, 1.5);
-    const candidates = timelineSnapCandidates(excludeClipId);
+    const candidates = timelineSnapCandidates(excludeClipIds);
     let bestStart = Math.max(0, rawStart);
     let snapTime: number | undefined;
     let bestDistance = thresholdSeconds + Number.EPSILON;
@@ -1743,10 +1997,45 @@ function EditorView(props: {
     if (!source) return;
     const bounds = event.currentTarget.getBoundingClientRect();
     const pointerTime = (event.clientX - bounds.left + timelineOffset) / Math.max(0.001, timelinePixelsPerSecond);
-    const snapped = snapTimelineStart(pointerTime - source.grabOffset, source.duration, source.source === 'clip' ? source.id : undefined);
+    const group = source.group || [];
+    const excludedIds = new Set(group.map((item) => item.id));
+    if (source.source === 'clip' && !excludedIds.size) excludedIds.add(source.id);
+    let snapped = snapTimelineStart(pointerTime - source.grabOffset, source.duration, excludedIds);
+    let groupPreview: TimelineDragPreview['group'];
+    if (source.source === 'clip' && group.length) {
+      const primary = group.find((item) => item.id === source.id) || group[0];
+      const minimumStart = Math.min(...group.map((item) => item.start));
+      const rawDelta = Math.max(-minimumStart, pointerTime - source.grabOffset - primary.start);
+      const threshold = clamp(10 / Math.max(0.001, timelinePixelsPerSecond), 1 / props.project.fps, 1.5);
+      const candidates = timelineSnapCandidates(excludedIds);
+      let bestAdjustment = 0;
+      let bestDistance = threshold + Number.EPSILON;
+      let snapTime: number | undefined;
+      group.forEach((item) => {
+        const movedStart = item.start + rawDelta;
+        candidates.forEach((candidate) => {
+          [candidate - movedStart, candidate - (movedStart + item.duration)].forEach((adjustment) => {
+            const distance = Math.abs(adjustment);
+            if (distance <= bestDistance && minimumStart + rawDelta + adjustment >= 0) {
+              bestDistance = distance;
+              bestAdjustment = adjustment;
+              snapTime = candidate;
+            }
+          });
+        });
+      });
+      const delta = rawDelta + bestAdjustment;
+      groupPreview = group.map((item) => ({ ...item, start: Math.max(0, item.start + delta) }));
+      snapped = { start: Math.max(0, primary.start + delta), snapTime };
+    }
     const resolvedTrackId = requestedTrackId.startsWith('__new_')
       ? undefined
-      : resolveTimelineTrack(source.kind, snapped.start, source.duration, requestedTrackId, source.source === 'clip' ? source.id : undefined);
+      : resolveTimelineTrack(source.kind, snapped.start, source.duration, requestedTrackId, excludedIds);
+    if (groupPreview?.length) {
+      groupPreview = groupPreview.map((item) => item.id === source.id
+        ? { ...item, trackId: resolvedTrackId || requestedTrackId }
+        : item);
+    }
     const nextPreview: TimelineDragPreview = {
       source: source.source,
       id: source.id,
@@ -1755,7 +2044,8 @@ function EditorView(props: {
       duration: source.duration,
       requestedTrackId,
       resolvedTrackId,
-      snapTime: snapped.snapTime
+      snapTime: snapped.snapTime,
+      group: groupPreview
     };
     timelineDragPreviewRef.current = nextPreview;
     setTimelineDragPreview(nextPreview);
@@ -1768,7 +2058,12 @@ function EditorView(props: {
     if (!preview) return;
     const destinationTrackId = preview.resolvedTrackId || trackId;
     if (preview.source === 'asset') props.onPlaceAsset(preview.id, preview.start, destinationTrackId);
-    else props.onMoveTimelineClip(preview.id, preview.start, destinationTrackId);
+    else {
+      const group = preview.group?.length
+        ? preview.group.map((item) => ({ clipId: item.id, start: item.start, trackId: item.id === preview.id ? destinationTrackId : item.trackId }))
+        : [{ clipId: preview.id, start: preview.start, trackId: destinationTrackId }];
+      props.onMoveTimelineClips(group);
+    }
     timelineDragSourceRef.current = null;
     timelineDragPreviewRef.current = null;
     setTimelineDragPreview(null);
@@ -1780,6 +2075,7 @@ function EditorView(props: {
     const lane = event.currentTarget.closest('.track-lane');
     if (!(lane instanceof HTMLElement)) return;
     event.currentTarget.setPointerCapture(event.pointerId);
+    props.onBeginHistoryTransaction();
     setTrimSnapTime(undefined);
     trimGestureRef.current = {
       pointerId: event.pointerId,
@@ -1799,7 +2095,7 @@ function EditorView(props: {
     const delta = (event.clientX - gesture.startX) / gesture.pixelsPerSecond;
     const thresholdSeconds = clamp(10 / Math.max(0.001, gesture.pixelsPerSecond), 1 / props.project.fps, 1.5);
     const snapValue = (rawTime: number) => {
-      const candidate = timelineSnapCandidates(gesture.clipId)
+      const candidate = timelineSnapCandidates(new Set([gesture.clipId]))
         .map((time) => ({ time, distance: Math.abs(time - rawTime) }))
         .filter((entry) => entry.distance <= thresholdSeconds)
         .sort((a, b) => a.distance - b.distance)[0];
@@ -1824,6 +2120,7 @@ function EditorView(props: {
     if (trimGestureRef.current?.pointerId === event.pointerId) {
       trimGestureRef.current = null;
       setTrimSnapTime(undefined);
+      props.onEndHistoryTransaction();
     }
   };
 
@@ -1963,8 +2260,12 @@ function EditorView(props: {
     if (clip.type === 'audio') return;
     event.preventDefault();
     event.stopPropagation();
-    selectClip(clip.id, event.ctrlKey || event.metaKey || event.shiftKey);
+    const additive = event.ctrlKey || event.metaKey || event.shiftKey;
+    if (additive || !selectedClipIds.includes(clip.id)) selectClip(clip.id, additive);
+    else setSelectedClipId(clip.id);
     event.currentTarget.setPointerCapture(event.pointerId);
+    props.onBeginHistoryTransaction();
+    const groupIds = mode === 'move' && selectedClipIds.includes(clip.id) ? selectedClipIds : [clip.id];
     transformGestureRef.current = {
       mode,
       pointerId: event.pointerId,
@@ -1974,6 +2275,10 @@ function EditorView(props: {
       originX: clip.transform.x,
       originY: clip.transform.y,
       originScale: clip.transform.scale,
+      groupOrigins: groupIds
+        .map((id) => props.project.timeline.find((item) => item.id === id))
+        .filter((item): item is TimelineItem => !!item && item.type !== 'audio')
+        .map((item) => ({ id: item.id, x: item.transform.x, y: item.transform.y })),
       stageWidth: Math.max(1, stageSize.width),
       stageHeight: Math.max(1, stageSize.height)
     };
@@ -1983,13 +2288,21 @@ function EditorView(props: {
     const gesture = transformGestureRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) return;
     if (gesture.mode === 'move') {
-      props.onUpdateClip(gesture.clipId, {
-        transform: {
-          ...(props.project.timeline.find((clip) => clip.id === gesture.clipId)?.transform || defaultTransform()),
-          x: clamp(gesture.originX + ((event.clientX - gesture.startX) / gesture.stageWidth) * 100, -100, 100),
-          y: clamp(gesture.originY + ((event.clientY - gesture.startY) / gesture.stageHeight) * 100, -100, 100)
-        }
-      });
+      const deltaX = ((event.clientX - gesture.startX) / gesture.stageWidth) * 100;
+      const deltaY = ((event.clientY - gesture.startY) / gesture.stageHeight) * 100;
+      props.onUpdateClips((gesture.groupOrigins || []).map((origin) => {
+        const current = props.project.timeline.find((clip) => clip.id === origin.id);
+        return {
+          clipId: origin.id,
+          patch: {
+            transform: {
+              ...(current?.transform || defaultTransform()),
+              x: clamp(origin.x + deltaX, -100, 100),
+              y: clamp(origin.y + deltaY, -100, 100)
+            }
+          }
+        };
+      }));
       return;
     }
     const delta = ((event.clientX - gesture.startX) / gesture.stageWidth + (event.clientY - gesture.startY) / gesture.stageHeight) / 2;
@@ -2002,7 +2315,10 @@ function EditorView(props: {
   };
 
   const endTransformGesture = (event: ReactPointerEvent<HTMLElement>) => {
-    if (transformGestureRef.current?.pointerId === event.pointerId) transformGestureRef.current = null;
+    if (transformGestureRef.current?.pointerId === event.pointerId) {
+      transformGestureRef.current = null;
+      props.onEndHistoryTransaction();
+    }
   };
 
   useEffect(() => {
@@ -2050,8 +2366,15 @@ function EditorView(props: {
         </button>
         <div className="header-actions">
           <span className={`save-pill ${props.saveStatus}`}>{statusCopy(props.saveStatus)}</span>
+          <div className="history-controls" aria-label="Historial">
+            <button className="btn btn-secondary btn-icon-square" title="Deshacer (Ctrl+Z)" aria-label="Deshacer" disabled={!props.canUndo} onClick={props.onUndo}><Undo2 size={17} /></button>
+            <button className="btn btn-secondary btn-icon-square" title="Rehacer (Ctrl+Y)" aria-label="Rehacer" disabled={!props.canRedo} onClick={props.onRedo}><Redo2 size={17} /></button>
+          </div>
           <button className="btn btn-secondary" onClick={props.onBack}><ArrowLeft size={16} /> Home</button>
-          <button className="btn btn-primary" onClick={props.onExport}><Download size={16} /> Exportar</button>
+          <button className="btn btn-primary" disabled={props.exportProgress !== null} onClick={props.onExport}>
+            {props.exportProgress !== null ? <Loader2 className="spin" size={16} /> : <Download size={16} />}
+            {props.exportProgress !== null ? `${props.exportProgress}%` : 'Exportar'}
+          </button>
           <div className="drive-profile">
             <button className="drive-profile-btn" title={props.profile?.email || 'Local'} aria-label="Account menu" onClick={() => setEditorProfileOpen((value) => !value)}>
               {props.profile?.picture ? <img className="drive-profile-avatar" src={props.profile.picture} alt="Profile" /> : <User size={19} />}
@@ -2219,7 +2542,7 @@ function EditorView(props: {
                     onPointerDown={(event) => beginTransform(event, clip, 'move')}
                   >
                     {asset.kind === 'video' ? (
-                      <video ref={(node) => { if (node) videoRefs.current.set(clip.id, node); else videoRefs.current.delete(clip.id); }} src={asset.objectUrl} muted playsInline controls={false} draggable={false} />
+                      <video ref={(node) => { if (node) videoRefs.current.set(clip.id, node); else videoRefs.current.delete(clip.id); }} src={asset.objectUrl} playsInline controls={false} draggable={false} preload="auto" />
                     ) : (
                       <img src={asset.objectUrl} alt="" draggable={false} />
                     )}
@@ -2260,6 +2583,17 @@ function EditorView(props: {
                     {selectedClipId === clip.id ? <button className="transform-handle" aria-label="Cambiar tamano" onPointerDown={(event) => beginTransform(event, clip, 'scale')} /> : null}
                   </div>
                 ))}
+              {activeAudioClips.map((clip) => {
+                const asset = clip.assetId ? props.project.assets.find((item) => item.id === clip.assetId) : undefined;
+                return asset?.objectUrl ? (
+                  <audio
+                    key={clip.id}
+                    ref={(node) => { if (node) audioRefs.current.set(clip.id, node); else audioRefs.current.delete(clip.id); }}
+                    src={asset.objectUrl}
+                    preload="auto"
+                  />
+                ) : null;
+              })}
             </div>
           </div>
           <div className="transport">
@@ -2294,7 +2628,7 @@ function EditorView(props: {
           <div className="panel-head">
             <div>
               <h2>Inspector</h2>
-              <span className="panel-subtitle">{selectedClip ? selectedClip.type : 'sin seleccion'}</span>
+              <span className="panel-subtitle">{selectedClipIds.length > 1 ? `${selectedClipIds.length} clips` : selectedClip ? selectedClip.type : 'sin seleccion'}</span>
             </div>
           </div>
           {selectedClip ? (
@@ -2322,7 +2656,7 @@ function EditorView(props: {
               <div className="inspector-actions">
                 {selectedClip.type !== 'audio' ? <button className="btn btn-secondary btn-icon-square" title="Restablecer transformacion" onClick={() => props.onUpdateClip(selectedClip.id, { transform: defaultTransform() })}><RotateCcw size={15} /></button> : null}
                 <button className="btn btn-secondary" disabled={!splittableClipIds.length} onClick={() => props.onSplitAtPlayhead(playhead, selectedClipIds)}><Scissors size={15} /> Dividir</button>
-                <button className="btn btn-secondary danger" onClick={() => props.onDeleteClip(selectedClip.id)}><Trash2 size={15} /> Borrar</button>
+                <button className="btn btn-secondary danger" onClick={() => { props.onDeleteClips(selectedClipIds.length ? selectedClipIds : [selectedClip.id]); clearClipSelection(); }}><Trash2 size={15} /> Borrar{selectedClipIds.length > 1 ? ` (${selectedClipIds.length})` : ''}</button>
               </div>
             </div>
           ) : (
@@ -2413,12 +2747,17 @@ function EditorView(props: {
                         onDragStart={(event) => {
                           event.stopPropagation();
                           const bounds = event.currentTarget.getBoundingClientRect();
+                          const dragIds = selectedClipIds.includes(clip.id) ? selectedClipIds : [clip.id];
+                          const group = props.project.timeline
+                            .filter((item) => dragIds.includes(item.id))
+                            .map((item) => ({ id: item.id, start: item.start, duration: item.duration, trackId: item.trackId, kind: item.type }));
                           timelineDragSourceRef.current = {
                             source: 'clip',
                             id: clip.id,
                             kind: clip.type,
                             duration: clip.duration,
-                            grabOffset: clamp((event.clientX - bounds.left) / Math.max(0.001, timelinePixelsPerSecond), 0, clip.duration)
+                            grabOffset: clamp((event.clientX - bounds.left) / Math.max(0.001, timelinePixelsPerSecond), 0, clip.duration),
+                            group
                           };
                           if (!selectedClipIds.includes(clip.id)) selectClip(clip.id);
                           event.dataTransfer.setData('application/x-inhouse-clip', clip.id);
@@ -2433,7 +2772,17 @@ function EditorView(props: {
                       </div>
                     );
                   })}
-                  {timelineDragPreview && ((timelineDragPreview.resolvedTrackId === track.id) || (track.virtual && !timelineDragPreview.resolvedTrackId)) ? (
+                  {timelineDragPreview?.group?.filter((item) => item.trackId === track.id).map((item) => (
+                    <div
+                      key={`preview_${item.id}`}
+                      className={`timeline-drop-preview ${item.kind}`}
+                      style={{
+                        left: `${(item.start / Math.max(1, timelineDisplayDuration)) * 100}%`,
+                        width: `${(item.duration / Math.max(1, timelineDisplayDuration)) * 100}%`
+                      }}
+                    />
+                  ))}
+                  {timelineDragPreview && !timelineDragPreview.group?.length && ((timelineDragPreview.resolvedTrackId === track.id) || (track.virtual && !timelineDragPreview.resolvedTrackId)) ? (
                     <div
                       className={`timeline-drop-preview ${timelineDragPreview.kind}`}
                       style={{
