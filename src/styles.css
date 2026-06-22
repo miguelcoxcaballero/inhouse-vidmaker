@@ -536,31 +536,36 @@ button {
   background: #fff;
 }
 
-.save-pill {
-  min-height: 34px;
-  padding: 8px 12px;
-  border-radius: 999px;
-  background: rgba(0, 0, 0, 0.045);
-  color: var(--text-secondary);
-  font-size: 0.78rem;
-  font-weight: 700;
-  white-space: nowrap;
+.save-indicator {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 10px;
+  border-radius: 50%;
+  background: var(--accent-green);
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.08);
+  transition: opacity 0.25s ease, background-color 0.25s ease;
 }
 
-.save-pill.saved {
-  background: rgba(52, 199, 89, 0.12);
-  color: #1d7f3b;
+.save-indicator.idle,
+.save-indicator.saved {
+  background: var(--accent-green);
 }
 
-.save-pill.saving,
-.save-pill.uploading {
-  background: rgba(224, 122, 60, 0.12);
-  color: #9b4d1f;
+.save-indicator.local,
+.save-indicator.saving {
+  background: #e6c619;
 }
 
-.save-pill.error {
-  background: rgba(232, 16, 16, 0.1);
-  color: #a11212;
+.save-indicator.uploading {
+  background: var(--accent-orange);
+}
+
+.save-indicator.paused {
+  background: #aaa;
+}
+
+.save-indicator.error {
+  background: var(--accent-red);
 }
 
 .drive-breadcrumbs {

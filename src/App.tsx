@@ -2365,12 +2365,7 @@ function EditorView(props: {
           <span className="doc-title">{props.project.name}</span>
         </button>
         <div className="header-actions">
-          <span className={`save-pill ${props.saveStatus}`}>{statusCopy(props.saveStatus)}</span>
-          <div className="history-controls" aria-label="Historial">
-            <button className="btn btn-secondary btn-icon-square" title="Deshacer (Ctrl+Z)" aria-label="Deshacer" disabled={!props.canUndo} onClick={props.onUndo}><Undo2 size={17} /></button>
-            <button className="btn btn-secondary btn-icon-square" title="Rehacer (Ctrl+Y)" aria-label="Rehacer" disabled={!props.canRedo} onClick={props.onRedo}><Redo2 size={17} /></button>
-          </div>
-          <button className="btn btn-secondary" onClick={props.onBack}><ArrowLeft size={16} /> Home</button>
+          <span className={`save-indicator ${props.saveStatus}`} title={statusCopy(props.saveStatus)} aria-label={statusCopy(props.saveStatus)} />
           <button className="btn btn-primary" disabled={props.exportProgress !== null} onClick={props.onExport}>
             {props.exportProgress !== null ? <Loader2 className="spin" size={16} /> : <Download size={16} />}
             {props.exportProgress !== null ? `${props.exportProgress}%` : 'Exportar'}
@@ -2681,7 +2676,10 @@ function EditorView(props: {
         <div className="timeline-toolbar">
           <div className="timeline-actions">
             <button className="btn btn-secondary" onClick={props.onAddText}><Type size={16} /> Texto</button>
-            <button className="btn btn-secondary" onClick={props.onPickFiles}><Upload size={16} /> Importar</button>
+            <div className="history-controls" aria-label="Historial">
+              <button className="btn btn-secondary btn-icon-square" title="Deshacer (Ctrl+Z)" aria-label="Deshacer" disabled={!props.canUndo} onClick={props.onUndo}><Undo2 size={17} /></button>
+              <button className="btn btn-secondary btn-icon-square" title="Rehacer (Ctrl+Y)" aria-label="Rehacer" disabled={!props.canRedo} onClick={props.onRedo}><Redo2 size={17} /></button>
+            </div>
           </div>
           <div className="timeline-meta">{props.project.timeline.length} clips - {props.project.duration.toFixed(1)}s - {Math.round(timelineZoom * 100)}%</div>
         </div>
