@@ -1955,9 +1955,16 @@ button {
 }
 
 .timeline-toolbar .btn-secondary {
-  min-height: 34px;
+  height: 36px;
+  min-height: 36px;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.04);
+}
+
+.timeline-actions .history-controls .btn-icon-square {
+  width: 36px;
+  height: 36px;
+  min-height: 36px;
 }
 
 .timeline-ruler {
