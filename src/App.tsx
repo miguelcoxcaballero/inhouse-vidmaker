@@ -780,6 +780,12 @@ export function App() {
     setFocusedClipId(clipId);
   }
 
+  function renameActiveProject(name: string) {
+    const nextName = sanitizeProjectName(name);
+    if (!activeProject || nextName === activeProject.name) return;
+    patchActiveProject((project) => ({ ...project, name: nextName }));
+  }
+
   function updateClip(clipId: string, patch: Partial<TimelineItem>) {
     patchActiveProject((project) => {
       const current = project.timeline.find((clip) => clip.id === clipId);
@@ -1009,6 +1015,7 @@ export function App() {
         onPickFiles={() => fileInputRef.current?.click()}
         fileInputRef={fileInputRef}
         onAddText={addTextClip}
+        onRenameProject={renameActiveProject}
         onPlaceAsset={placeAssetOnTimeline}
         onMoveTimelineClips={moveTimelineClips}
         onCreateAssetFolder={createAssetFolder}
@@ -1636,6 +1643,7 @@ function EditorView(props: {
   onDragLeave(): void;
   onPickFiles(): void;
   onAddText(): void;
+  onRenameProject(name: string): void;
   onPlaceAsset(assetId: string, start: number, trackId?: string): void;
   onMoveTimelineClips(moves: Array<{ clipId: string; start: number; trackId: string }>): void;
   onCreateAssetFolder(name: string, parentId?: string): void;
@@ -1684,6 +1692,10 @@ function EditorView(props: {
   const [playheadSnapTime, setPlayheadSnapTime] = useState<number | undefined>();
   const [timelineSelectionBox, setTimelineSelectionBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
   const previewCanvasRef = useRef<HTMLDivElement>(null);
+  const projectTitleRef = useRef<HTMLSpanElement>(null);
+  const projectTitleOriginalRef = useRef(props.project.name);
+  const projectTitleEditingRef = useRef(false);
+  const cancelProjectTitleEditRef = useRef(false);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const audioRefs = useRef(new Map<string, HTMLAudioElement>());
   const appliedFocusRef = useRef<string | undefined>(undefined);
@@ -1742,6 +1754,7 @@ function EditorView(props: {
   } | null>(null);
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const [timelineScrollbarWidth, setTimelineScrollbarWidth] = useState(0);
+  const [projectTitleEditing, setProjectTitleEditing] = useState(false);
   const selectedClip = props.project.timeline.find((clip) => clip.id === selectedClipId);
   const activeVisualClips = props.project.timeline
     .filter((clip) => clip.start <= playhead && playhead < clip.start + clip.duration && (clip.type === 'video' || clip.type === 'image'))
@@ -1772,6 +1785,35 @@ function EditorView(props: {
   const splittableClipIds = (selectedClipIds.length ? props.project.timeline.filter((clip) => selectedClipIds.includes(clip.id)) : props.project.timeline)
     .filter((clip) => playhead > clip.start + 1 / props.project.fps && playhead < clip.start + clip.duration - 1 / props.project.fps)
     .map((clip) => clip.id);
+
+  useEffect(() => {
+    if (!projectTitleEditingRef.current && projectTitleRef.current) {
+      projectTitleRef.current.textContent = props.project.name;
+    }
+  }, [props.project.name]);
+
+  const beginProjectTitleEdit = () => {
+    const title = projectTitleRef.current;
+    if (!title || projectTitleEditingRef.current) return;
+    projectTitleOriginalRef.current = title.textContent || props.project.name;
+    projectTitleEditingRef.current = true;
+    cancelProjectTitleEditRef.current = false;
+    setProjectTitleEditing(true);
+  };
+
+  const finishProjectTitleEdit = () => {
+    const title = projectTitleRef.current;
+    if (!title || !projectTitleEditingRef.current) return;
+    const canceled = cancelProjectTitleEditRef.current;
+    const nextName = canceled
+      ? projectTitleOriginalRef.current
+      : sanitizeProjectName(title.textContent || '');
+    title.textContent = nextName;
+    projectTitleEditingRef.current = false;
+    cancelProjectTitleEditRef.current = false;
+    setProjectTitleEditing(false);
+    if (!canceled) props.onRenameProject(nextName);
+  };
 
   useEffect(() => {
     if (!props.focusedClipId || appliedFocusRef.current === props.focusedClipId) return;
@@ -2359,11 +2401,38 @@ function EditorView(props: {
       onDragLeave={props.onDragLeave}
     >
       <header className="editor-topbar">
-        <button className="logo-button" onClick={props.onBack}>
-          <RoofLogo />
-          <span className="brand-name">inhouse vidmaker</span>
-          <span className="doc-title">{props.project.name}</span>
-        </button>
+        <div className="logo-button">
+          <button className="editor-brand-home" onClick={props.onBack} title="Drive Home" aria-label="Drive Home">
+            <RoofLogo />
+            <span className="brand-name">inhouse vidmaker</span>
+          </button>
+          <span
+            ref={projectTitleRef}
+            className={`doc-title ${projectTitleEditing ? 'editing' : ''}`}
+            role="textbox"
+            aria-label="Nombre del video"
+            contentEditable
+            suppressContentEditableWarning
+            spellCheck={false}
+            onFocus={beginProjectTitleEdit}
+            onBlur={finishProjectTitleEdit}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => {
+              event.stopPropagation();
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                event.currentTarget.blur();
+              } else if (event.key === 'Escape') {
+                event.preventDefault();
+                cancelProjectTitleEditRef.current = true;
+                event.currentTarget.blur();
+              }
+            }}
+          >
+            {props.project.name}
+          </span>
+        </div>
         <div className="header-actions">
           <span className={`save-indicator ${props.saveStatus}`} title={statusCopy(props.saveStatus)} aria-label={statusCopy(props.saveStatus)} />
           <button className="btn btn-primary" disabled={props.exportProgress !== null} onClick={props.onExport}>
@@ -2504,7 +2573,6 @@ function EditorView(props: {
                 <strong>{props.project.name}</strong>
                 <span>{props.project.width}x{props.project.height} - {props.project.fps}fps</span>
               </div>
-              <span>{playhead.toFixed(1)}s</span>
             </div>
             <div
               className="preview-stage"

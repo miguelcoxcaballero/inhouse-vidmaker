@@ -471,8 +471,12 @@ button {
 }
 
 [data-theme="dark"] .timeline-toolbar .btn-secondary,
-[data-theme="dark"] .doc-title,
 [data-theme="dark"] .asset-kind-pill {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+[data-theme="dark"] .doc-title.editing,
+[data-theme="dark"] .doc-title:focus {
   background: rgba(255, 255, 255, 0.08);
 }
 
@@ -566,6 +570,10 @@ button {
 
 .save-indicator.error {
   background: var(--accent-red);
+}
+
+.header-actions > .save-indicator {
+  margin-right: 8px;
 }
 
 .drive-breadcrumbs {
@@ -1181,17 +1189,43 @@ button {
   font-size: 1rem;
 }
 
+.editor-topbar .logo-button {
+  gap: 0;
+}
+
+.editor-brand-home {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  font: inherit;
+}
+
 .doc-title {
+  display: inline-flex;
+  align-items: center;
   font-family: 'DM Sans', sans-serif;
-  font-size: 0.9rem;
-  font-weight: 700;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-left: 12px;
   border-radius: 8px;
   padding: 4px 8px;
-  background: rgba(0, 0, 0, 0.045);
-  max-width: 260px;
+  max-width: 320px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: text;
+}
+
+.doc-title.editing,
+.doc-title:focus {
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--text-primary);
+  outline: 2px solid rgba(0, 47, 217, 0.3);
+  outline-offset: 2px;
+  max-width: 420px;
+  text-overflow: clip;
 }
 
 .editor-grid {
@@ -2324,6 +2358,11 @@ button {
 
   .doc-title {
     max-width: 120px;
+  }
+
+  .doc-title.editing,
+  .doc-title:focus {
+    max-width: min(52vw, 180px);
   }
 
   .header-actions {
