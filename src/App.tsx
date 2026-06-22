@@ -1,24 +1,34 @@
 import {
   ArrowLeft,
+  ArrowDown,
+  ArrowUp,
   ChevronDown,
   ChevronRight,
   Download,
   Film,
+  FlipHorizontal2,
+  FlipVertical2,
   Folder,
   FolderInput,
   FolderPlus,
   Fullscreen,
   Grid2X2,
   Home,
+  Eye,
+  EyeOff,
   Image as ImageIcon,
   Loader2,
   List,
+  Lock,
+  Maximize2,
+  Minus,
   MoreVertical,
   Music,
   Pause,
   Play,
   Plus,
   RefreshCw,
+  Repeat2,
   RotateCcw,
   Scissors,
   Search,
@@ -26,9 +36,12 @@ import {
   Type,
   Undo2,
   Upload,
+  Unlock,
   User,
   Video,
-  Redo2
+  Redo2,
+  Volume2,
+  VolumeX
 } from 'lucide-react';
 import { ChangeEvent, CSSProperties, DragEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createDriveClient } from './drive';
@@ -40,6 +53,7 @@ import {
   clamp,
   createEmptyProject,
   defaultTransform,
+  defaultTextStyle,
   formatBytes,
   formatWhen,
   normalizeLoadedProject,
@@ -140,9 +154,86 @@ function readAssetMetadata(kind: AssetRecord['kind'], objectUrl: string): Promis
   });
 }
 
+async function captureVideoThumbnails(objectUrl: string, count = 5): Promise<string[]> {
+  const video = document.createElement('video');
+  video.src = objectUrl;
+  video.muted = true;
+  video.preload = 'auto';
+  video.playsInline = true;
+  await new Promise<void>((resolve, reject) => {
+    video.onloadedmetadata = () => resolve();
+    video.onerror = () => reject(new Error('No se pudieron generar miniaturas.'));
+  });
+  const canvas = document.createElement('canvas');
+  canvas.width = 160;
+  canvas.height = 90;
+  const context = canvas.getContext('2d');
+  if (!context) return [];
+  const duration = Number.isFinite(video.duration) ? video.duration : 0;
+  const frames: string[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const time = duration > 0 ? Math.min(duration - 0.01, (duration * (index + 0.5)) / count) : 0;
+    video.currentTime = Math.max(0, time);
+    await new Promise<void>((resolve) => {
+      if (video.readyState >= 2 && Math.abs(video.currentTime - time) < 0.02) resolve();
+      else video.onseeked = () => resolve();
+    });
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    frames.push(canvas.toDataURL('image/jpeg', 0.68));
+  }
+  video.removeAttribute('src');
+  video.load();
+  return frames;
+}
+
+function colorWithAlpha(color: string, alpha: number) {
+  const hex = color.replace('#', '');
+  if (/^[0-9a-f]{6}$/i.test(hex)) {
+    const value = Number.parseInt(hex, 16);
+    return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, ${clamp(alpha, 0, 1)})`;
+  }
+  return color;
+}
+
 function timelineItemsOverlap(start: number, duration: number, other: TimelineItem): boolean {
   const epsilon = 0.001;
   return start < other.start + other.duration - epsilon && start + duration > other.start + epsilon;
+}
+
+function compactTimelineTracks(timeline: TimelineItem[], trackIds: Set<string>): TimelineItem[] {
+  const next = timeline.map((clip) => ({ ...clip }));
+  trackIds.forEach((trackId) => {
+    let cursor = 0;
+    next
+      .filter((clip) => clip.trackId === trackId)
+      .sort((a, b) => a.start - b.start)
+      .forEach((clip) => {
+        clip.start = Number(cursor.toFixed(4));
+        cursor += clip.duration;
+      });
+  });
+  return next;
+}
+
+function appendClipsWithoutOverlap(project: ProjectRecord, clips: TimelineItem[]) {
+  let tracks = [...project.tracks];
+  const timeline = [...project.timeline];
+  clips.sort((a, b) => a.start - b.start).forEach((clip) => {
+    const kind = clip.type === 'audio' ? 'audio' : clip.type === 'text' ? 'text' : 'video';
+    const isFree = (trackId: string) => !timeline.some((item) => item.trackId === trackId && timelineItemsOverlap(clip.start, clip.duration, item));
+    let track = tracks.find((item) => item.id === clip.trackId && item.kind === kind && !item.locked && isFree(item.id));
+    if (!track) track = tracks.find((item) => item.kind === kind && !item.locked && isFree(item.id));
+    if (!track) {
+      const count = tracks.filter((item) => item.kind === kind).length + 1;
+      track = { id: uid(`track_${kind}`), name: `${kind === 'video' ? 'Video' : kind === 'audio' ? 'Audio' : 'Texto'} ${count}`, kind, locked: false, muted: false, hidden: false };
+      const firstMatching = tracks.findIndex((item) => item.kind === kind);
+      tracks = kind === 'audio' || firstMatching < 0
+        ? [...tracks, track]
+        : [...tracks.slice(0, firstMatching), track, ...tracks.slice(firstMatching)];
+    }
+    timeline.push({ ...clip, trackId: track.id });
+  });
+  return { tracks, timeline };
 }
 
 export function App() {
@@ -173,6 +264,8 @@ export function App() {
   const redoStackRef = useRef<ProjectRecord[]>([]);
   const historyTransactionRef = useRef<HistoryTransaction | null>(null);
   const activeProjectRef = useRef<ProjectRecord | undefined>(undefined);
+  const assetBlobCacheRef = useRef(new Map<string, Blob>());
+  const assetLoadPromisesRef = useRef(new Map<string, Promise<void>>());
 
   const activeProject = useMemo(
     () => projects.find((project) => project.id === activeProjectId),
@@ -419,17 +512,13 @@ export function App() {
       const files = await drive.listProjects();
       const loaded = await Promise.all(files.map(async (file) => {
         const project = normalizeLoadedProject(await drive.downloadJson<ProjectRecord>(file.id));
-        const assets = await Promise.all(project.assets.map(async (asset) => {
-          if (!asset.driveFileId) return asset;
-          try {
-            const blob = await drive.downloadFile(asset.driveFileId);
-            const objectUrl = URL.createObjectURL(blob);
-            const metadata = asset.width || asset.height || asset.duration ? {} : await readAssetMetadata(asset.kind, objectUrl);
-            return { ...asset, ...metadata, objectUrl, uploadState: 'uploaded' as const };
-          } catch {
-            return { ...asset, uploadState: 'error' as const };
-          }
-        }));
+        const localProject = projects.find((item) => item.id === project.id);
+        const assets = project.assets.map((asset) => {
+          const local = localProject?.assets.find((item) => item.id === asset.id || (!!item.driveFileId && item.driveFileId === asset.driveFileId));
+          return local?.objectUrl
+            ? { ...asset, objectUrl: local.objectUrl, uploadState: local.uploadState }
+            : { ...asset, objectUrl: undefined, uploadState: asset.driveFileId ? 'uploaded' as const : asset.uploadState };
+        });
         return { ...project, assets, projectFileId: file.id, trashedAt: undefined, updatedAt: project.updatedAt || file.modifiedTime || nowIso() };
       }));
       setProjects((current) => {
@@ -443,6 +532,75 @@ export function App() {
     } catch (error) {
       setSaveStatus('error');
       setToast(error instanceof Error ? error.message : 'No se pudieron cargar proyectos.');
+    }
+  }
+
+  async function ensureAssetLoaded(assetId: string, quiet = false): Promise<void> {
+    const project = activeProjectRef.current;
+    const asset = project?.assets.find((item) => item.id === assetId);
+    if (!project || !asset || asset.objectUrl || !asset.driveFileId) return;
+    const pending = assetLoadPromisesRef.current.get(assetId);
+    if (pending) return pending;
+    const promise = (async () => {
+      try {
+        patchActiveProject((current) => ({
+          ...current,
+          assets: current.assets.map((item) => item.id === assetId ? { ...item, uploadState: 'uploading' } : item)
+        }), false);
+        let blob = assetBlobCacheRef.current.get(asset.driveFileId!);
+        if (!blob) {
+          blob = await drive.downloadFile(asset.driveFileId!);
+          assetBlobCacheRef.current.set(asset.driveFileId!, blob);
+        }
+        const objectUrl = URL.createObjectURL(blob);
+        const metadata = asset.width || asset.height || asset.duration ? {} : await readAssetMetadata(asset.kind, objectUrl);
+        patchActiveProject((current) => ({
+          ...current,
+          assets: current.assets.map((item) => item.id === assetId ? { ...item, ...metadata, objectUrl, uploadState: 'uploaded' } : item)
+        }), false);
+      } catch (error) {
+        patchActiveProject((current) => ({
+          ...current,
+          assets: current.assets.map((item) => item.id === assetId ? { ...item, uploadState: 'error' } : item)
+        }), false);
+        if (!quiet) setToast(error instanceof Error ? error.message : `No se pudo cargar ${asset.name}.`);
+        throw error;
+      } finally {
+        assetLoadPromisesRef.current.delete(assetId);
+      }
+    })();
+    assetLoadPromisesRef.current.set(assetId, promise);
+    return promise;
+  }
+
+  async function retryAsset(assetId: string) {
+    const project = activeProjectRef.current;
+    const asset = project?.assets.find((item) => item.id === assetId);
+    if (!project || !asset) return;
+    if (asset.driveFileId) {
+      await ensureAssetLoaded(assetId);
+      return;
+    }
+    if (!asset.objectUrl || !project.assetsFolderId) return;
+    try {
+      patchActiveProject((current) => ({
+        ...current,
+        assets: current.assets.map((item) => item.id === assetId ? { ...item, uploadState: 'uploading' } : item)
+      }), false);
+      const blob = await fetch(asset.objectUrl).then((response) => response.blob());
+      const file = new File([blob], asset.name, { type: asset.mimeType });
+      const uploaded = await drive.uploadFile(file, asset.folderId || project.assetsFolderId);
+      patchActiveProject((current) => ({
+        ...current,
+        assets: current.assets.map((item) => item.id === assetId ? { ...item, driveFileId: uploaded.id, uploadState: 'uploaded' } : item)
+      }), false);
+      setToast(`${asset.name} se ha subido correctamente.`);
+    } catch (error) {
+      patchActiveProject((current) => ({
+        ...current,
+        assets: current.assets.map((item) => item.id === assetId ? { ...item, uploadState: 'error' } : item)
+      }), false);
+      setToast(error instanceof Error ? error.message : `No se pudo reintentar ${asset.name}.`);
     }
   }
 
@@ -621,7 +779,7 @@ export function App() {
       let tracks = project.tracks;
       if (!track) {
         const count = project.tracks.filter((item) => item.kind === trackKind).length + 1;
-        track = { id: uid(`track_${trackKind}`), name: `${trackKind === 'video' ? 'Video' : 'Audio'} ${count}`, kind: trackKind, locked: false, muted: false };
+        track = { id: uid(`track_${trackKind}`), name: `${trackKind === 'video' ? 'Video' : 'Audio'} ${count}`, kind: trackKind, locked: false, muted: false, hidden: false };
         const firstVideo = tracks.findIndex((item) => item.kind === 'video');
         tracks = trackKind === 'video' && firstVideo >= 0
           ? [...tracks.slice(0, firstVideo), track, ...tracks.slice(firstVideo)]
@@ -634,7 +792,10 @@ export function App() {
         assetId: asset.id,
         start: safeStart,
         duration,
-        transform: defaultTransform()
+        transform: defaultTransform(),
+        transition: { type: 'none', duration: 0.5 },
+        playbackRate: 1,
+        reverse: false
       };
       return { ...project, tracks, timeline: [...project.timeline, clip], duration: Math.max(project.duration, safeStart + duration) };
     });
@@ -651,6 +812,7 @@ export function App() {
       moves.forEach((move) => {
         const moving = project.timeline.find((clip) => clip.id === move.clipId);
         if (!moving) return;
+        if (project.tracks.find((item) => item.id === moving.trackId)?.locked) return;
         const trackKind = moving.type === 'audio' ? 'audio' : moving.type === 'text' ? 'text' : 'video';
         const safeStart = Math.max(0, move.start);
         const isFree = (trackId: string) => {
@@ -669,7 +831,7 @@ export function App() {
         if (!track) track = tracks.find((item) => item.kind === trackKind && isFree(item.id));
         if (!track) {
           const count = tracks.filter((item) => item.kind === trackKind).length + 1;
-          track = { id: uid(`track_${trackKind}`), name: `${trackKind === 'text' ? 'Texto' : trackKind === 'video' ? 'Video' : 'Audio'} ${count}`, kind: trackKind, locked: false, muted: false };
+          track = { id: uid(`track_${trackKind}`), name: `${trackKind === 'text' ? 'Texto' : trackKind === 'video' ? 'Video' : 'Audio'} ${count}`, kind: trackKind, locked: false, muted: false, hidden: false };
           const firstMatching = tracks.findIndex((item) => item.kind === trackKind);
           tracks = trackKind === 'audio' || firstMatching < 0
             ? [...tracks, track]
@@ -758,22 +920,32 @@ export function App() {
     if (!activeProject) return;
     const start = activeProject.timeline.reduce((max, clip) => Math.max(max, clip.start + clip.duration), 0);
     const clipId = uid('clip');
-    patchActiveProject((project) => ({
-      ...project,
-      timeline: [
-        ...project.timeline,
-        {
+    patchActiveProject((project) => {
+      let tracks = project.tracks;
+      let textTrack = tracks.find((track) => track.kind === 'text' && !track.locked);
+      if (!textTrack) {
+        textTrack = { id: uid('track_text'), name: `Texto ${tracks.filter((track) => track.kind === 'text').length + 1}`, kind: 'text', locked: false, muted: false, hidden: false };
+        tracks = [textTrack, ...tracks];
+      }
+      return {
+        ...project,
+        tracks,
+        timeline: [...project.timeline, {
           id: clipId,
           type: 'text',
-          trackId: 'track_text',
+          trackId: textTrack.id,
           start,
           duration: 4,
           text: 'inhouse vidmaker',
-          transform: defaultTransform()
-        }
-      ],
-      duration: Math.max(project.duration, start + 4)
-    }));
+          transform: defaultTransform(),
+          textStyle: defaultTextStyle(),
+          transition: { type: 'none', duration: 0.5 },
+          playbackRate: 1,
+          reverse: false
+        }],
+        duration: Math.max(project.duration, start + 4)
+      };
+    });
     setFocusedClipId(clipId);
   }
 
@@ -783,11 +955,22 @@ export function App() {
     patchActiveProject((project) => ({ ...project, name: nextName }));
   }
 
-  function updateClip(clipId: string, patch: Partial<TimelineItem>) {
+  function updateClip(clipId: string, patch: Partial<TimelineItem>, ripple = false) {
     patchActiveProject((project) => {
       const current = project.timeline.find((clip) => clip.id === clipId);
       if (!current) return project;
+      if (project.tracks.find((track) => track.id === current.trackId)?.locked) return project;
       let updated = { ...current, ...patch };
+      if (patch.playbackRate !== undefined) {
+        const previousRate = current.playbackRate || 1;
+        const playbackRate = clamp(Number(patch.playbackRate) || 1, 0.1, 8);
+        updated = { ...updated, playbackRate, duration: Math.max(0.2, current.duration * previousRate / playbackRate) };
+        if (!ripple) {
+          const nextStart = project.timeline.filter((clip) => clip.id !== clipId && clip.trackId === current.trackId && clip.start >= current.start)
+            .reduce((start, clip) => Math.min(start, clip.start), Number.POSITIVE_INFINITY);
+          if (Number.isFinite(nextStart)) updated.duration = Math.max(0.2, Math.min(updated.duration, nextStart - current.start));
+        }
+      }
       if (patch.start !== undefined || patch.duration !== undefined) {
         const siblings = project.timeline.filter((clip) => clip.id !== clipId && clip.trackId === current.trackId);
         if (patch.start !== undefined && patch.duration === undefined) {
@@ -804,11 +987,14 @@ export function App() {
         }
         if (siblings.some((clip) => timelineItemsOverlap(updated.start, updated.duration, clip))) updated = current;
       }
-      const timeline = project.timeline.map((clip) => clip.id === clipId ? updated : clip);
+      let timeline = project.timeline.map((clip) => clip.id === clipId ? updated : clip);
+      if (ripple && (patch.start !== undefined || patch.duration !== undefined || patch.playbackRate !== undefined)) {
+        timeline = compactTimelineTracks(timeline, new Set([current.trackId]));
+      }
       return {
         ...project,
         timeline,
-        duration: Math.max(project.duration, ...timeline.map((clip) => clip.start + clip.duration))
+        duration: ripple ? Math.max(1, ...timeline.map((clip) => clip.start + clip.duration)) : Math.max(project.duration, ...timeline.map((clip) => clip.start + clip.duration))
       };
     });
   }
@@ -820,7 +1006,8 @@ export function App() {
       ...project,
       timeline: project.timeline.map((clip) => {
         const patch = patches.get(clip.id);
-        return patch ? { ...clip, ...patch } : clip;
+        const locked = project.tracks.find((track) => track.id === clip.trackId)?.locked;
+        return patch && !locked ? { ...clip, ...patch } : clip;
       })
     }));
   }
@@ -833,6 +1020,7 @@ export function App() {
         ? selected
         : new Set(project.timeline.filter((clip) => time > clip.start + frameDuration && time < clip.start + clip.duration - frameDuration).map((clip) => clip.id));
       const timeline = project.timeline.flatMap((clip) => {
+        if (project.tracks.find((track) => track.id === clip.trackId)?.locked) return [clip];
         if (!targetIds.has(clip.id) || time <= clip.start + frameDuration || time >= clip.start + clip.duration - frameDuration) return [clip];
         const firstDuration = Number((time - clip.start).toFixed(4));
         const secondDuration = Number((clip.duration - firstDuration).toFixed(4));
@@ -851,13 +1039,78 @@ export function App() {
     });
   }
 
-  function deleteClips(clipIds: string[]) {
+  function deleteClips(clipIds: string[], ripple = false) {
     const ids = new Set(clipIds);
     if (!ids.size) return;
+    patchActiveProject((project) => {
+      const deletable = new Set(project.timeline
+        .filter((clip) => ids.has(clip.id) && !project.tracks.find((track) => track.id === clip.trackId)?.locked)
+        .map((clip) => clip.id));
+      const affectedTracks = new Set(project.timeline.filter((clip) => deletable.has(clip.id)).map((clip) => clip.trackId));
+      let timeline = project.timeline.filter((clip) => !deletable.has(clip.id));
+      if (ripple) timeline = compactTimelineTracks(timeline, affectedTracks);
+      return { ...project, timeline, duration: Math.max(1, ...timeline.map((clip) => clip.start + clip.duration)) };
+    });
+  }
+
+  function updateTrack(trackId: string, patch: Partial<TimelineTrack>) {
     patchActiveProject((project) => ({
       ...project,
-      timeline: project.timeline.filter((clip) => !ids.has(clip.id))
+      tracks: project.tracks.map((track) => track.id === trackId ? { ...track, ...patch } : track)
     }));
+  }
+
+  function reorderTrack(trackId: string, direction: -1 | 1) {
+    patchActiveProject((project) => {
+      const index = project.tracks.findIndex((track) => track.id === trackId);
+      const target = index + direction;
+      if (index < 0 || target < 0 || target >= project.tracks.length) return project;
+      const tracks = [...project.tracks];
+      [tracks[index], tracks[target]] = [tracks[target], tracks[index]];
+      return { ...project, tracks };
+    });
+  }
+
+  function deleteTrack(trackId: string) {
+    patchActiveProject((project) => {
+      const removed = project.tracks.find((track) => track.id === trackId);
+      let tracks = project.tracks.filter((track) => track.id !== trackId);
+      if (removed && !tracks.some((track) => track.kind === removed.kind)) {
+        tracks = [...tracks, { id: uid(`track_${removed.kind}`), name: removed.kind === 'video' ? 'Video 1' : removed.kind === 'audio' ? 'Audio 1' : 'Texto', kind: removed.kind, locked: false, muted: false, hidden: false }];
+      }
+      const timeline = project.timeline.filter((clip) => clip.trackId !== trackId);
+      return { ...project, tracks, timeline, duration: Math.max(1, ...timeline.map((clip) => clip.start + clip.duration)) };
+    });
+  }
+
+  function duplicateClips(clipIds: string[], atTime?: number) {
+    const ids = new Set(clipIds);
+    if (!ids.size) return;
+    patchActiveProject((project) => {
+      const source = project.timeline.filter((clip) => ids.has(clip.id));
+      if (!source.length) return project;
+      const earliest = Math.min(...source.map((clip) => clip.start));
+      const latest = Math.max(...source.map((clip) => clip.start + clip.duration));
+      const targetStart = atTime ?? latest + 0.1;
+      const clones = source.map((clip) => ({ ...structuredClone(clip), id: uid('clip'), start: targetStart + clip.start - earliest }));
+      const appended = appendClipsWithoutOverlap(project, clones);
+      return { ...project, ...appended, duration: Math.max(project.duration, ...clones.map((clip) => clip.start + clip.duration)) };
+    });
+  }
+
+  function pasteClips(source: TimelineItem[], atTime: number) {
+    if (!source.length) return;
+    patchActiveProject((project) => {
+      const earliest = Math.min(...source.map((clip) => clip.start));
+      const clones = source.map((clip) => ({ ...structuredClone(clip), id: uid('clip'), start: Math.max(0, atTime + clip.start - earliest) }));
+      const appended = appendClipsWithoutOverlap(project, clones);
+      return { ...project, ...appended, duration: Math.max(project.duration, ...clones.map((clip) => clip.start + clip.duration)) };
+    });
+  }
+
+  function saveNow() {
+    const project = activeProjectRef.current;
+    if (project) void runDriveSync(project);
   }
 
   function onDrop(event: DragEvent<HTMLElement>) {
@@ -874,16 +1127,20 @@ export function App() {
   async function exportVideo() {
     if (!activeProject || exportProgress !== null) return;
     try {
-      const missingAssets = activeProject.timeline
+      const requiredAssetIds = Array.from(new Set(activeProject.timeline.map((clip) => clip.assetId).filter((id): id is string => !!id)));
+      await Promise.all(requiredAssetIds.map((assetId) => ensureAssetLoaded(assetId)));
+      const projectToExport = activeProjectRef.current;
+      if (!projectToExport) return;
+      const missingAssets = projectToExport.timeline
         .filter((clip) => clip.assetId)
-        .map((clip) => activeProject.assets.find((asset) => asset.id === clip.assetId))
+        .map((clip) => projectToExport.assets.find((asset) => asset.id === clip.assetId))
         .filter((asset) => !asset?.objectUrl);
       if (missingAssets.length) throw new Error('Hay archivos de la timeline que no estan disponibles localmente. Recarga el proyecto antes de exportar.');
       setExportProgress(0);
       setToast('Preparando exportacion...');
       const { renderProjectToMp4 } = await import('./exportVideo');
-      const exportedVideo = await renderProjectToMp4(activeProject, { onProgress: setExportProgress });
-      const renderName = `${activeProject.name.replace(/[^\w.-]+/g, '_') || 'inhouse_vidmaker'}.mp4`;
+      const exportedVideo = await renderProjectToMp4(projectToExport, { onProgress: setExportProgress });
+      const renderName = `${projectToExport.name.replace(/[^\w.-]+/g, '_') || 'inhouse_vidmaker'}.mp4`;
       const url = URL.createObjectURL(exportedVideo);
       const download = document.createElement('a');
       download.href = url;
@@ -921,6 +1178,8 @@ export function App() {
         onThemeChange={changeTheme}
         onSignOut={signOut}
         onFiles={addFiles}
+        onEnsureAssetLoaded={ensureAssetLoaded}
+        onRetryAsset={retryAsset}
         onDragOver={onDragOver}
         onDragLeave={() => setDragging(false)}
         onPickFiles={() => fileInputRef.current?.click()}
@@ -937,6 +1196,12 @@ export function App() {
         onUpdateClips={updateClips}
         onSplitAtPlayhead={splitAtPlayhead}
         onDeleteClips={deleteClips}
+        onUpdateTrack={updateTrack}
+        onReorderTrack={reorderTrack}
+        onDeleteTrack={deleteTrack}
+        onDuplicateClips={duplicateClips}
+        onPasteClips={pasteClips}
+        onSave={saveNow}
         onBeginHistoryTransaction={beginHistoryTransaction}
         onEndHistoryTransaction={endHistoryTransaction}
         onUndo={undoProject}
@@ -1550,6 +1815,8 @@ function EditorView(props: {
   onThemeChange(theme: ThemeMode): void;
   onSignOut(): void;
   onFiles(files: FileList | File[], destinationFolderId?: string): void;
+  onEnsureAssetLoaded(assetId: string, quiet?: boolean): Promise<void>;
+  onRetryAsset(assetId: string): void;
   onDragOver(event: DragEvent<HTMLElement>): void;
   onDragLeave(): void;
   onPickFiles(): void;
@@ -1561,10 +1828,16 @@ function EditorView(props: {
   onMoveAsset(assetId: string, destinationFolderId?: string): void;
   onTrashAsset(assetId: string): void;
   onRestoreAsset(assetId: string): void;
-  onUpdateClip(clipId: string, patch: Partial<TimelineItem>): void;
+  onUpdateClip(clipId: string, patch: Partial<TimelineItem>, ripple?: boolean): void;
   onUpdateClips(updates: Array<{ clipId: string; patch: Partial<TimelineItem> }>): void;
   onSplitAtPlayhead(time: number, selectedClipIds: string[]): void;
-  onDeleteClips(clipIds: string[]): void;
+  onDeleteClips(clipIds: string[], ripple?: boolean): void;
+  onUpdateTrack(trackId: string, patch: Partial<TimelineTrack>): void;
+  onReorderTrack(trackId: string, direction: -1 | 1): void;
+  onDeleteTrack(trackId: string): void;
+  onDuplicateClips(clipIds: string[], atTime?: number): void;
+  onPasteClips(clips: TimelineItem[], atTime: number): void;
+  onSave(): void;
   onBeginHistoryTransaction(): void;
   onEndHistoryTransaction(): void;
   onUndo(): void;
@@ -1585,6 +1858,11 @@ function EditorView(props: {
   const [assetFolderName, setAssetFolderName] = useState('');
   const [movingAssetId, setMovingAssetId] = useState<string | undefined>();
   const [showAssetBin, setShowAssetBin] = useState(false);
+  const [rippleEnabled, setRippleEnabled] = useState(true);
+  const [shortcutsEnabled, setShortcutsEnabled] = useState(true);
+  const [mobilePanel, setMobilePanel] = useState<'assets' | 'preview' | 'inspector'>('preview');
+  const [renamingTrackId, setRenamingTrackId] = useState<string | undefined>();
+  const [videoThumbnails, setVideoThumbnails] = useState<Record<string, string[]>>({});
   const [assetPanelWidth, setAssetPanelWidth] = useState(getDefaultSidePanelWidth);
   const [inspectorPanelWidth, setInspectorPanelWidth] = useState(getDefaultSidePanelWidth);
   const [timelineHeight, setTimelineHeight] = useState(getDefaultTimelineHeight);
@@ -1609,6 +1887,7 @@ function EditorView(props: {
   const cancelProjectTitleEditRef = useRef(false);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const audioRefs = useRef(new Map<string, HTMLAudioElement>());
+  const clipboardClipsRef = useRef<TimelineItem[]>([]);
   const appliedFocusRef = useRef<string | undefined>(undefined);
   const tracksRef = useRef<HTMLDivElement>(null);
   const timelineRulerRef = useRef<HTMLDivElement>(null);
@@ -1667,10 +1946,13 @@ function EditorView(props: {
   const [timelineScrollbarWidth, setTimelineScrollbarWidth] = useState(0);
   const [projectTitleEditing, setProjectTitleEditing] = useState(false);
   const selectedClip = props.project.timeline.find((clip) => clip.id === selectedClipId);
+  const selectedClipTrack = selectedClip ? props.project.tracks.find((track) => track.id === selectedClip.trackId) : undefined;
+  const selectedTextStyle = selectedClip?.textStyle || defaultTextStyle();
+  const selectedTransition = selectedClip?.transition || { type: 'none' as const, duration: 0.5 };
   const activeVisualClips = props.project.timeline
-    .filter((clip) => clip.start <= playhead && playhead < clip.start + clip.duration && (clip.type === 'video' || clip.type === 'image'))
+    .filter((clip) => clip.start <= playhead && playhead < clip.start + clip.duration && (clip.type === 'video' || clip.type === 'image') && !props.project.tracks.find((track) => track.id === clip.trackId)?.hidden)
     .sort((a, b) => props.project.tracks.findIndex((track) => track.id === b.trackId) - props.project.tracks.findIndex((track) => track.id === a.trackId));
-  const activeAudioClips = props.project.timeline.filter((clip) => clip.type === 'audio' && clip.start <= playhead && playhead < clip.start + clip.duration);
+  const activeAudioClips = props.project.timeline.filter((clip) => clip.type === 'audio' && clip.start <= playhead && playhead < clip.start + clip.duration && !props.project.tracks.find((track) => track.id === clip.trackId)?.hidden);
   const activeAudioAsset = activeAudioClips[0]?.assetId ? props.project.assets.find((asset) => asset.id === activeAudioClips[0].assetId) : undefined;
   const timelineDisplayDuration = props.project.duration / Math.min(1, timelineZoom);
   const timelineContentWidth = timelineViewportWidth * Math.max(1, timelineZoom);
@@ -1737,6 +2019,27 @@ function EditorView(props: {
   }, [props.focusedClipId, props.project.timeline, props.project.duration]);
 
   useEffect(() => {
+    const required = new Set([
+      ...activeVisualClips.map((clip) => clip.assetId),
+      ...activeAudioClips.map((clip) => clip.assetId),
+      selectedClip?.assetId,
+      selectedAssetId
+    ].filter((id): id is string => !!id));
+    required.forEach((assetId) => { void props.onEnsureAssetLoaded(assetId, true).catch(() => undefined); });
+  }, [playhead, selectedClip?.assetId, selectedAssetId, props.project.id]);
+
+  useEffect(() => {
+    let canceled = false;
+    const assets = props.project.assets.filter((asset) => asset.kind === 'video' && asset.objectUrl && props.project.timeline.some((clip) => clip.assetId === asset.id) && !videoThumbnails[asset.id]);
+    assets.forEach((asset) => {
+      void captureVideoThumbnails(asset.objectUrl!).then((frames) => {
+        if (!canceled && frames.length) setVideoThumbnails((current) => ({ ...current, [asset.id]: frames }));
+      }).catch(() => undefined);
+    });
+    return () => { canceled = true; };
+  }, [props.project.assets, props.project.timeline, videoThumbnails]);
+
+  useEffect(() => {
     const validIds = selectedClipIds.filter((id) => props.project.timeline.some((clip) => clip.id === id));
     if (validIds.length !== selectedClipIds.length) {
       setSelectedClipIds(validIds);
@@ -1746,6 +2049,7 @@ function EditorView(props: {
 
   useEffect(() => {
     const handleEditorShortcut = (event: KeyboardEvent) => {
+      if (!shortcutsEnabled) return;
       const target = event.target as HTMLElement | null;
       if (target?.matches('input, textarea, [contenteditable="true"]')) return;
       const modifier = event.ctrlKey || event.metaKey;
@@ -1760,15 +2064,35 @@ function EditorView(props: {
       } else if (modifier && key === 'y') {
         event.preventDefault();
         props.onRedo();
+      } else if (modifier && key === 's') {
+        event.preventDefault();
+        props.onSave();
+      } else if (modifier && key === 'd' && selectedClipIds.length) {
+        event.preventDefault();
+        props.onDuplicateClips(selectedClipIds);
+      } else if (modifier && key === 'c' && selectedClipIds.length) {
+        event.preventDefault();
+        clipboardClipsRef.current = props.project.timeline.filter((clip) => selectedClipIds.includes(clip.id)).map((clip) => structuredClone(clip));
+      } else if (modifier && key === 'v' && clipboardClipsRef.current.length) {
+        event.preventDefault();
+        props.onPasteClips(clipboardClipsRef.current, playhead);
       } else if ((event.key === 'Delete' || event.key === 'Backspace') && selectedClipIds.length) {
         event.preventDefault();
-        props.onDeleteClips(selectedClipIds);
+        props.onDeleteClips(selectedClipIds, rippleEnabled);
         clearClipSelection();
+      } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        event.preventDefault();
+        setPlaying(false);
+        const direction = event.key === 'ArrowLeft' ? -1 : 1;
+        setPlayhead((current) => clamp(current + direction / props.project.fps, 0, props.project.duration));
+      } else if (event.code === 'Space') {
+        event.preventDefault();
+        setPlaying((current) => !current);
       }
     };
     window.addEventListener('keydown', handleEditorShortcut);
     return () => window.removeEventListener('keydown', handleEditorShortcut);
-  }, [playhead, props, selectedClipIds, splittableClipIds.length]);
+  }, [playhead, props, rippleEnabled, selectedClipIds, shortcutsEnabled, splittableClipIds.length]);
 
   useEffect(() => {
     activeVisualClips.forEach((clip) => {
@@ -1776,18 +2100,24 @@ function EditorView(props: {
       const video = videoRefs.current.get(clip.id);
       if (!video) return;
       video.muted = !!props.project.tracks.find((track) => track.id === clip.trackId)?.muted;
-      const clipTime = Math.max(0, playhead - clip.start + (clip.trimStart || 0));
+      const rate = clip.playbackRate || 1;
+      const localTime = Math.max(0, playhead - clip.start);
+      const clipTime = Math.max(0, (clip.trimStart || 0) + (clip.reverse ? clip.duration * rate - localTime * rate - 1 / props.project.fps : localTime * rate));
+      video.playbackRate = rate;
       if (!playing || Math.abs(video.currentTime - clipTime) > 0.25) video.currentTime = clipTime;
-      if (playing) void video.play().catch(() => setPlaying(false));
+      if (playing && !clip.reverse) void video.play().catch(() => setPlaying(false));
       else video.pause();
     });
     activeAudioClips.forEach((clip) => {
       const audio = audioRefs.current.get(clip.id);
       if (!audio) return;
       audio.muted = !!props.project.tracks.find((track) => track.id === clip.trackId)?.muted;
-      const clipTime = Math.max(0, playhead - clip.start + (clip.trimStart || 0));
+      const rate = clip.playbackRate || 1;
+      const localTime = Math.max(0, playhead - clip.start);
+      const clipTime = Math.max(0, (clip.trimStart || 0) + (clip.reverse ? clip.duration * rate - localTime * rate - 1 / props.project.fps : localTime * rate));
+      audio.playbackRate = rate;
       if (!playing || Math.abs(audio.currentTime - clipTime) > 0.25) audio.currentTime = clipTime;
-      if (playing) void audio.play().catch(() => setPlaying(false));
+      if (playing && !clip.reverse) void audio.play().catch(() => setPlaying(false));
       else audio.pause();
     });
   }, [playhead, playing, activeVisualClips, activeAudioClips, props.project.tracks]);
@@ -1910,9 +2240,9 @@ function EditorView(props: {
   const resolveTimelineTrack = (kind: TimelineItem['type'], start: number, duration: number, requestedTrackId: string, excludeClipIds = new Set<string>()) => {
     const requiredKind = timelineTrackKind(kind);
     const isFree = (trackId: string) => !props.project.timeline.some((clip) => !excludeClipIds.has(clip.id) && clip.trackId === trackId && timelineItemsOverlap(start, duration, clip));
-    const requested = props.project.tracks.find((track) => track.id === requestedTrackId && track.kind === requiredKind);
+    const requested = props.project.tracks.find((track) => track.id === requestedTrackId && track.kind === requiredKind && !track.locked);
     if (requested && isFree(requested.id)) return requested.id;
-    return props.project.tracks.find((track) => track.kind === requiredKind && isFree(track.id))?.id;
+    return props.project.tracks.find((track) => track.kind === requiredKind && !track.locked && isFree(track.id))?.id;
   };
 
   const timelineSnapCandidates = (excludeClipIds = new Set<string>()) => [
@@ -2025,6 +2355,7 @@ function EditorView(props: {
   const beginTrim = (event: ReactPointerEvent<HTMLElement>, clip: TimelineItem, edge: 'start' | 'end') => {
     event.preventDefault();
     event.stopPropagation();
+    if (props.project.tracks.find((track) => track.id === clip.trackId)?.locked) return;
     const lane = event.currentTarget.closest('.track-lane');
     if (!(lane instanceof HTMLElement)) return;
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -2070,9 +2401,12 @@ function EditorView(props: {
   };
 
   const endTrim = (event: ReactPointerEvent<HTMLElement>) => {
-    if (trimGestureRef.current?.pointerId === event.pointerId) {
+    const gesture = trimGestureRef.current;
+    if (gesture?.pointerId === event.pointerId) {
       trimGestureRef.current = null;
       setTrimSnapTime(undefined);
+      const clip = props.project.timeline.find((item) => item.id === gesture.clipId);
+      if (clip && rippleEnabled) props.onUpdateClip(clip.id, { start: clip.start, duration: clip.duration }, true);
       props.onEndHistoryTransaction();
     }
   };
@@ -2089,6 +2423,7 @@ function EditorView(props: {
       kind,
       locked: false,
       muted: false,
+      hidden: false,
       virtual: true
     };
     const firstMatchingTrack = timelineTracksForRender.findIndex((track) => track.kind === kind);
@@ -2171,6 +2506,16 @@ function EditorView(props: {
     setTimelineOffset(clamp(timeAtCursor * nextPixelsPerSecond - cursorX, 0, nextMaxOffset));
   };
 
+  const setTimelineZoomLevel = (nextValue: number) => {
+    const nextZoom = clamp(nextValue, 0.25, 8);
+    const centerTime = (timelineOffset + timelineViewportWidth / 2) / Math.max(0.001, timelinePixelsPerSecond);
+    const nextContentWidth = timelineViewportWidth * Math.max(1, nextZoom);
+    const nextDisplayDuration = props.project.duration / Math.min(1, nextZoom);
+    const nextPixelsPerSecond = nextContentWidth / Math.max(1, nextDisplayDuration);
+    setTimelineZoom(nextZoom);
+    setTimelineOffset(clamp(centerTime * nextPixelsPerSecond - timelineViewportWidth / 2, 0, Math.max(0, nextContentWidth - timelineViewportWidth)));
+  };
+
   useEffect(() => {
     const panel = timelinePanelRef.current;
     if (!panel) return;
@@ -2211,6 +2556,7 @@ function EditorView(props: {
 
   const beginTransform = (event: ReactPointerEvent<HTMLElement>, clip: TimelineItem, mode: 'move' | 'scale') => {
     if (clip.type === 'audio') return;
+    if (props.project.tracks.find((track) => track.id === clip.trackId)?.locked) return;
     event.preventDefault();
     event.stopPropagation();
     const additive = event.ctrlKey || event.metaKey || event.shiftKey;
@@ -2291,7 +2637,7 @@ function EditorView(props: {
 
   return (
     <main
-      className={`editor-shell ${props.isDragging ? 'dragging' : ''}`}
+      className={`editor-shell mobile-${mobilePanel} ${props.isDragging ? 'dragging' : ''}`}
       style={{
         '--asset-panel-width': `${assetPanelWidth}px`,
         '--inspector-panel-width': `${inspectorPanelWidth}px`,
@@ -2376,6 +2722,11 @@ function EditorView(props: {
       </header>
 
       <section className="editor-grid">
+        <div className="mobile-editor-tabs" role="tablist" aria-label="Panel del editor">
+          <button className={mobilePanel === 'assets' ? 'active' : ''} onClick={() => setMobilePanel('assets')}>Assets</button>
+          <button className={mobilePanel === 'preview' ? 'active' : ''} onClick={() => setMobilePanel('preview')}>Video</button>
+          <button className={mobilePanel === 'inspector' ? 'active' : ''} onClick={() => setMobilePanel('inspector')}>Inspector</button>
+        </div>
         <aside className="asset-panel">
           <div className="panel-head">
             <div>
@@ -2424,14 +2775,15 @@ function EditorView(props: {
                   className="asset-open-button"
                   draggable={!showAssetBin}
                   onDragStart={(event) => {
+                    void props.onEnsureAssetLoaded(asset.id, true).catch(() => undefined);
                     const duration = asset.kind === 'image' ? 5 : clamp(asset.duration || 6, 0.2, 60 * 60);
                     timelineDragSourceRef.current = { source: 'asset', id: asset.id, kind: asset.kind, duration, grabOffset: 0 };
                     event.dataTransfer.setData('application/x-inhouse-asset', asset.id);
                     event.dataTransfer.effectAllowed = 'copy';
                   }}
                   onDragEnd={() => { timelineDragSourceRef.current = null; timelineDragPreviewRef.current = null; setTimelineDragPreview(null); }}
-                  onClick={() => focusAsset(asset.id)}
-                  onDoubleClick={() => props.onPlaceAsset(asset.id, playhead)}
+                  onClick={() => { focusAsset(asset.id); void props.onEnsureAssetLoaded(asset.id).catch(() => undefined); }}
+                  onDoubleClick={() => { void props.onEnsureAssetLoaded(asset.id).then(() => props.onPlaceAsset(asset.id, playhead)).catch(() => undefined); }}
                   title="Arrastra a la timeline o haz doble clic"
                 >
                   <span className={`asset-thumbnail ${asset.kind}`}>
@@ -2439,14 +2791,16 @@ function EditorView(props: {
                     {asset.objectUrl && asset.kind === 'video' ? <video src={asset.objectUrl} muted playsInline preload="metadata" draggable={false} onLoadedMetadata={(event) => { if (event.currentTarget.duration > 0) event.currentTarget.currentTime = Math.min(0.1, event.currentTarget.duration / 2); }} /> : null}
                     {asset.kind === 'audio' ? <Music size={28} /> : null}
                     {!asset.objectUrl && asset.kind !== 'audio' ? (asset.kind === 'video' ? <Video size={28} /> : <ImageIcon size={28} />) : null}
+                    {asset.uploadState === 'uploading' ? <Loader2 className="asset-loading spin" size={20} /> : null}
                   </span>
-                  <span className="asset-copy"><strong>{asset.name}</strong><span>{formatBytes(asset.size)} - {asset.uploadState}</span></span>
+                  <span className="asset-copy"><strong>{asset.name}</strong><span>{formatBytes(asset.size)} - {asset.uploadState === 'error' ? 'error' : asset.uploadState === 'uploading' ? 'cargando' : 'listo'}</span></span>
                 </button>
                 <div className="asset-row-actions">
                   {showAssetBin ? (
                     <button title="Restaurar" onClick={() => props.onRestoreAsset(asset.id)}><RotateCcw size={15} /></button>
                   ) : (
                     <>
+                      {asset.uploadState === 'error' ? <button className="danger" title="Reintentar" onClick={() => props.onRetryAsset(asset.id)}><RefreshCw size={15} /></button> : null}
                       <button title="Mover" onClick={() => setMovingAssetId(movingAssetId === asset.id ? undefined : asset.id)}><FolderInput size={15} /></button>
                       <button title="Mover a la papelera" onClick={() => props.onTrashAsset(asset.id)}><Trash2 size={15} /></button>
                     </>
@@ -2497,9 +2851,15 @@ function EditorView(props: {
                 if (!asset?.objectUrl) return null;
                 const projectRatio = props.project.width / props.project.height;
                 const assetRatio = asset.width && asset.height ? asset.width / asset.height : projectRatio;
-                const mediaWidth = assetRatio >= projectRatio ? 100 : (assetRatio / projectRatio) * 100;
-                const mediaHeight = assetRatio >= projectRatio ? (projectRatio / assetRatio) * 100 : 100;
+                const mediaWidth = clip.transform.fit === 'cover' ? 100 : assetRatio >= projectRatio ? 100 : (assetRatio / projectRatio) * 100;
+                const mediaHeight = clip.transform.fit === 'cover' ? 100 : assetRatio >= projectRatio ? (projectRatio / assetRatio) * 100 : 100;
                 const trackIndex = props.project.tracks.findIndex((track) => track.id === clip.trackId);
+                const transition = clip.transition || { type: 'none', duration: 0.5 };
+                const transitionProgress = transition.type === 'none' ? 1 : clamp((playhead - clip.start) / Math.max(0.05, Math.min(clip.duration, transition.duration)), 0, 1);
+                const transitionOpacity = transition.type === 'fade' || transition.type === 'dissolve' ? transitionProgress : 1;
+                const slideOffset = transition.type === 'slide' ? (1 - transitionProgress) * 24 : 0;
+                const cropRight = Math.max(0, 100 - clip.transform.cropX - clip.transform.cropWidth);
+                const cropBottom = Math.max(0, 100 - clip.transform.cropY - clip.transform.cropHeight);
                 return (
                   <div
                     key={clip.id}
@@ -2507,18 +2867,19 @@ function EditorView(props: {
                     style={{
                       width: `${mediaWidth}%`,
                       height: `${mediaHeight}%`,
-                      left: `${50 + clip.transform.x}%`,
+                      left: `${50 + clip.transform.x + slideOffset}%`,
                       top: `${50 + clip.transform.y}%`,
                       zIndex: props.project.tracks.length - trackIndex,
                       transform: `translate(-50%, -50%) scale(${clip.transform.scale}) rotate(${clip.transform.rotation}deg)`,
-                      opacity: clip.transform.opacity / 100
+                      opacity: (clip.transform.opacity / 100) * transitionOpacity,
+                      clipPath: `inset(${clip.transform.cropY}% ${cropRight}% ${cropBottom}% ${clip.transform.cropX}%)`
                     }}
                     onPointerDown={(event) => beginTransform(event, clip, 'move')}
                   >
                     {asset.kind === 'video' ? (
-                      <video ref={(node) => { if (node) videoRefs.current.set(clip.id, node); else videoRefs.current.delete(clip.id); }} src={asset.objectUrl} playsInline controls={false} draggable={false} preload="auto" />
+                      <video ref={(node) => { if (node) videoRefs.current.set(clip.id, node); else videoRefs.current.delete(clip.id); }} src={asset.objectUrl} playsInline controls={false} draggable={false} preload="auto" style={{ objectFit: clip.transform.fit, transform: `scaleX(${clip.transform.flipX ? -1 : 1}) scaleY(${clip.transform.flipY ? -1 : 1})` }} />
                     ) : (
-                      <img src={asset.objectUrl} alt="" draggable={false} />
+                      <img src={asset.objectUrl} alt="" draggable={false} style={{ objectFit: clip.transform.fit, transform: `scaleX(${clip.transform.flipX ? -1 : 1}) scaleY(${clip.transform.flipY ? -1 : 1})` }} />
                     )}
                     {selectedClipId === clip.id ? (
                       <button
@@ -2540,23 +2901,34 @@ function EditorView(props: {
                 </div>
               ) : null}
               {props.project.timeline
-                .filter((clip) => clip.type === 'text' && clip.start <= playhead && clip.start + clip.duration >= playhead)
-                .map((clip) => (
-                  <div
+                .filter((clip) => clip.type === 'text' && clip.start <= playhead && clip.start + clip.duration >= playhead && !props.project.tracks.find((track) => track.id === clip.trackId)?.hidden)
+                .map((clip) => {
+                  const style = clip.textStyle || defaultTextStyle();
+                  const localProgress = clamp((playhead - clip.start) / Math.max(0.15, Math.min(0.7, clip.duration)), 0, 1);
+                  const transition = clip.transition || { type: 'none', duration: 0.5 };
+                  const transitionProgress = transition.type === 'none' ? 1 : clamp((playhead - clip.start) / Math.max(0.05, Math.min(clip.duration, transition.duration)), 0, 1);
+                  const animatedText = style.animation === 'typewriter' ? (clip.text || '').slice(0, Math.ceil((clip.text || '').length * localProgress)) : clip.text;
+                  const animationOpacity = style.animation === 'fade' ? localProgress : 1;
+                  const animationY = style.animation === 'slide-up' ? (1 - localProgress) * 20 : 0;
+                  const transitionOpacity = transition.type === 'fade' || transition.type === 'dissolve' ? transitionProgress : 1;
+                  const transitionX = transition.type === 'slide' ? (1 - transitionProgress) * 24 : 0;
+                  const trackIndex = props.project.tracks.findIndex((track) => track.id === clip.trackId);
+                  return <div
                     className={`preview-text-layer ${selectedClipIds.includes(clip.id) ? 'selected' : ''}`}
                     key={clip.id}
                     style={{
-                      left: `${50 + clip.transform.x}%`,
-                      top: `${50 + clip.transform.y}%`,
+                      left: `${50 + clip.transform.x + transitionX}%`,
+                      top: `${50 + clip.transform.y + animationY}%`,
                       transform: `translate(-50%, -50%) scale(${clip.transform.scale}) rotate(${clip.transform.rotation}deg)`,
-                      opacity: clip.transform.opacity / 100
+                      opacity: (clip.transform.opacity / 100) * animationOpacity * transitionOpacity,
+                      zIndex: props.project.tracks.length - trackIndex
                     }}
                     onPointerDown={(event) => beginTransform(event, clip, 'move')}
                   >
-                    <span>{clip.text}</span>
+                    <span style={{ fontFamily: style.fontFamily, fontSize: `${Math.max(8, style.fontSize * stageSize.width / props.project.width)}px`, color: style.color, textAlign: style.align, background: colorWithAlpha(style.backgroundColor, style.backgroundOpacity / 100) }}>{animatedText}</span>
                     {selectedClipId === clip.id ? <button className="transform-handle" aria-label="Cambiar tamano" onPointerDown={(event) => beginTransform(event, clip, 'scale')} /> : null}
                   </div>
-                ))}
+                })}
               {activeAudioClips.map((clip) => {
                 const asset = clip.assetId ? props.project.assets.find((item) => item.id === clip.assetId) : undefined;
                 return asset?.objectUrl ? (
@@ -2611,10 +2983,34 @@ function EditorView(props: {
                 <strong>{selectedClip.type === 'text' ? (selectedClip.text || 'Texto') : selectedClip.type}</strong>
                 <span>{selectedClip.start.toFixed(1)}s - {(selectedClip.start + selectedClip.duration).toFixed(1)}s</span>
               </div>
-              <label>Inicio <input type="number" value={selectedClip.start} min={0} step={0.1} onChange={(event) => props.onUpdateClip(selectedClip.id, { start: Number(event.target.value) })} /></label>
-              <label>Duracion <input type="number" value={selectedClip.duration} min={0.2} step={0.1} onChange={(event) => props.onUpdateClip(selectedClip.id, { duration: Number(event.target.value) })} /></label>
+              {selectedClipTrack?.locked ? <div className="inspector-notice"><Lock size={14} /> Esta pista esta bloqueada.</div> : null}
+              <label>Inicio <input type="number" value={selectedClip.start} min={0} step={0.1} disabled={selectedClipTrack?.locked} onChange={(event) => props.onUpdateClip(selectedClip.id, { start: Number(event.target.value) }, rippleEnabled)} /></label>
+              <label>Duracion <input type="number" value={selectedClip.duration} min={0.2} step={0.1} disabled={selectedClipTrack?.locked} onChange={(event) => props.onUpdateClip(selectedClip.id, { duration: Number(event.target.value) }, rippleEnabled)} /></label>
               {selectedClip.type === 'text' ? (
-                <label>Texto <textarea value={selectedClip.text || ''} onChange={(event) => props.onUpdateClip(selectedClip.id, { text: event.target.value })} /></label>
+                <>
+                  <label>Texto <textarea value={selectedClip.text || ''} onChange={(event) => props.onUpdateClip(selectedClip.id, { text: event.target.value })} /></label>
+                  <div className="transform-field-row">
+                    <label>Tipografia
+                      <select value={selectedTextStyle.fontFamily} onChange={(event) => props.onUpdateClip(selectedClip.id, { textStyle: { ...selectedTextStyle, fontFamily: event.target.value } })}>
+                        <option value="DM Sans">DM Sans</option><option value="Comfortaa">Comfortaa</option><option value="Arial">Arial</option><option value="Georgia">Georgia</option><option value="monospace">Monospace</option>
+                      </select>
+                    </label>
+                    <label>Tamano <input type="number" min={10} max={240} value={selectedTextStyle.fontSize} onChange={(event) => props.onUpdateClip(selectedClip.id, { textStyle: { ...selectedTextStyle, fontSize: clamp(Number(event.target.value), 10, 240) } })} /></label>
+                  </div>
+                  <div className="transform-field-row color-fields">
+                    <label>Color <input type="color" value={selectedTextStyle.color} onChange={(event) => props.onUpdateClip(selectedClip.id, { textStyle: { ...selectedTextStyle, color: event.target.value } })} /></label>
+                    <label>Fondo <input type="color" value={selectedTextStyle.backgroundColor} onChange={(event) => props.onUpdateClip(selectedClip.id, { textStyle: { ...selectedTextStyle, backgroundColor: event.target.value } })} /></label>
+                  </div>
+                  <label>Opacidad del fondo <input type="range" min={0} max={100} value={selectedTextStyle.backgroundOpacity} onChange={(event) => props.onUpdateClip(selectedClip.id, { textStyle: { ...selectedTextStyle, backgroundOpacity: Number(event.target.value) } })} /><span className="field-value">{selectedTextStyle.backgroundOpacity}%</span></label>
+                  <div className="segmented inspector-segmented" aria-label="Alineacion">
+                    {(['left', 'center', 'right'] as const).map((align) => <button key={align} className={selectedTextStyle.align === align ? 'active' : ''} onClick={() => props.onUpdateClip(selectedClip.id, { textStyle: { ...selectedTextStyle, align } })}>{align === 'left' ? 'Izq.' : align === 'center' ? 'Centro' : 'Der.'}</button>)}
+                  </div>
+                  <label>Animacion
+                    <select value={selectedTextStyle.animation} onChange={(event) => props.onUpdateClip(selectedClip.id, { textStyle: { ...selectedTextStyle, animation: event.target.value as typeof selectedTextStyle.animation } })}>
+                      <option value="none">Ninguna</option><option value="fade">Fundido</option><option value="slide-up">Entrada vertical</option><option value="typewriter">Maquina de escribir</option>
+                    </select>
+                  </label>
+                </>
               ) : null}
               {selectedClip.type !== 'audio' ? (
                 <>
@@ -2624,13 +3020,48 @@ function EditorView(props: {
                   </div>
                   <label>Escala <input type="range" min={10} max={500} value={selectedClip.transform.scale * 100} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, scale: Number(event.target.value) / 100 } })} /><span className="field-value">{Math.round(selectedClip.transform.scale * 100)}%</span></label>
                   <label>Rotacion <input type="number" min={-180} max={180} step={1} value={selectedClip.transform.rotation} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, rotation: clamp(Number(event.target.value), -180, 180) } })} /></label>
+                  {selectedClip.type === 'image' || selectedClip.type === 'video' ? (
+                    <>
+                      <div className="transform-field-row">
+                        <label>Encuadre
+                          <select value={selectedClip.transform.fit} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, fit: event.target.value as 'contain' | 'cover' } })}>
+                            <option value="contain">Contener</option><option value="cover">Cubrir</option>
+                          </select>
+                        </label>
+                        <div className="flip-actions">
+                          <button className={`btn btn-secondary btn-icon-square ${selectedClip.transform.flipX ? 'active' : ''}`} title="Voltear horizontalmente" onClick={() => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, flipX: !selectedClip.transform.flipX } })}><FlipHorizontal2 size={16} /></button>
+                          <button className={`btn btn-secondary btn-icon-square ${selectedClip.transform.flipY ? 'active' : ''}`} title="Voltear verticalmente" onClick={() => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, flipY: !selectedClip.transform.flipY } })}><FlipVertical2 size={16} /></button>
+                        </div>
+                      </div>
+                      <div className="crop-grid">
+                        <label>Recorte X <input type="number" min={0} max={95} value={selectedClip.transform.cropX} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, cropX: clamp(Number(event.target.value), 0, 100 - selectedClip.transform.cropWidth) } })} /></label>
+                        <label>Recorte Y <input type="number" min={0} max={95} value={selectedClip.transform.cropY} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, cropY: clamp(Number(event.target.value), 0, 100 - selectedClip.transform.cropHeight) } })} /></label>
+                        <label>Ancho % <input type="number" min={5} max={100} value={selectedClip.transform.cropWidth} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, cropWidth: clamp(Number(event.target.value), 5, 100 - selectedClip.transform.cropX) } })} /></label>
+                        <label>Alto % <input type="number" min={5} max={100} value={selectedClip.transform.cropHeight} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, cropHeight: clamp(Number(event.target.value), 5, 100 - selectedClip.transform.cropY) } })} /></label>
+                      </div>
+                    </>
+                  ) : null}
+                </>
+              ) : null}
+              <div className="transform-field-row">
+                <label>Transicion
+                  <select value={selectedTransition.type} onChange={(event) => props.onUpdateClip(selectedClip.id, { transition: { ...selectedTransition, type: event.target.value as typeof selectedTransition.type } })}>
+                    <option value="none">Ninguna</option><option value="fade">Fundido</option><option value="dissolve">Disolver</option><option value="slide">Deslizar</option>
+                  </select>
+                </label>
+                <label>Duracion <input type="number" min={0.1} max={Math.max(0.1, selectedClip.duration)} step={0.1} value={selectedTransition.duration} onChange={(event) => props.onUpdateClip(selectedClip.id, { transition: { ...selectedTransition, duration: clamp(Number(event.target.value), 0.1, selectedClip.duration) } })} /></label>
+              </div>
+              {selectedClip.type === 'video' || selectedClip.type === 'audio' ? (
+                <>
+                  <label>Velocidad <input type="range" min={25} max={400} step={25} value={(selectedClip.playbackRate || 1) * 100} onChange={(event) => props.onUpdateClip(selectedClip.id, { playbackRate: Number(event.target.value) / 100 }, rippleEnabled)} /><span className="field-value">{selectedClip.playbackRate || 1}x</span></label>
+                  <label className="inspector-check"><input type="checkbox" checked={!!selectedClip.reverse} onChange={(event) => props.onUpdateClip(selectedClip.id, { reverse: event.target.checked })} /> Reproduccion inversa</label>
                 </>
               ) : null}
               <label>Opacidad <input type="range" min={0} max={100} value={selectedClip.transform.opacity} onChange={(event) => props.onUpdateClip(selectedClip.id, { transform: { ...selectedClip.transform, opacity: Number(event.target.value) } })} /></label>
               <div className="inspector-actions">
                 {selectedClip.type !== 'audio' ? <button className="btn btn-secondary btn-icon-square" title="Restablecer transformacion" onClick={() => props.onUpdateClip(selectedClip.id, { transform: defaultTransform() })}><RotateCcw size={15} /></button> : null}
                 <button className="btn btn-secondary" disabled={!splittableClipIds.length} onClick={() => props.onSplitAtPlayhead(playhead, selectedClipIds)}><Scissors size={15} /> Dividir</button>
-                <button className="btn btn-secondary danger" onClick={() => { props.onDeleteClips(selectedClipIds.length ? selectedClipIds : [selectedClip.id]); clearClipSelection(); }}><Trash2 size={15} /> Borrar{selectedClipIds.length > 1 ? ` (${selectedClipIds.length})` : ''}</button>
+                <button className="btn btn-secondary danger" onClick={() => { props.onDeleteClips(selectedClipIds.length ? selectedClipIds : [selectedClip.id], rippleEnabled); clearClipSelection(); }}><Trash2 size={15} /> Borrar{selectedClipIds.length > 1 ? ` (${selectedClipIds.length})` : ''}</button>
               </div>
             </div>
           ) : (
@@ -2659,8 +3090,23 @@ function EditorView(props: {
               <button className="btn btn-secondary btn-icon-square" title="Deshacer (Ctrl+Z)" aria-label="Deshacer" disabled={!props.canUndo} onClick={props.onUndo}><Undo2 size={17} /></button>
               <button className="btn btn-secondary btn-icon-square" title="Rehacer (Ctrl+Y)" aria-label="Rehacer" disabled={!props.canRedo} onClick={props.onRedo}><Redo2 size={17} /></button>
             </div>
+            <label className={`toolbar-toggle ${rippleEnabled ? 'active' : ''}`} title="Cerrar huecos automaticamente al borrar o recortar">
+              <input type="checkbox" checked={rippleEnabled} onChange={(event) => setRippleEnabled(event.target.checked)} />
+              <Repeat2 size={15} /> Ripple
+            </label>
+            <label className={`toolbar-toggle ${shortcutsEnabled ? 'active' : ''}`} title="Delete, Ctrl+D, Ctrl+C/V, flechas, espacio y Ctrl+S">
+              <input type="checkbox" checked={shortcutsEnabled} onChange={(event) => setShortcutsEnabled(event.target.checked)} />
+              Atajos
+            </label>
           </div>
-          <div className="timeline-meta">{props.project.timeline.length} clips - {props.project.duration.toFixed(1)}s - {Math.round(timelineZoom * 100)}%</div>
+          <div className="timeline-toolbar-right">
+            <div className="timeline-zoom-controls" aria-label="Zoom de timeline">
+              <button title="Alejar" aria-label="Alejar" onClick={() => setTimelineZoomLevel(timelineZoom / 1.25)}><Minus size={15} /></button>
+              <button title="Ajustar timeline" aria-label="Ajustar timeline" onClick={() => { setTimelineZoom(1); setTimelineOffset(0); }}><Maximize2 size={15} /></button>
+              <button title="Acercar" aria-label="Acercar" onClick={() => setTimelineZoomLevel(timelineZoom * 1.25)}><Plus size={15} /></button>
+            </div>
+            <div className="timeline-meta">{props.project.timeline.length} clips - {props.project.duration.toFixed(1)}s - {Math.round(timelineZoom * 100)}%</div>
+          </div>
         </div>
         <div
           className="timeline-ruler timeline-scrub-area"
@@ -2693,8 +3139,28 @@ function EditorView(props: {
         </div>
         <div className="tracks" ref={tracksRef}>
           {timelineTracksForRender.map((track) => (
-            <div className={`track-row ${track.virtual ? 'virtual' : ''}`} key={track.id}>
-              <div className="track-label">{track.name}</div>
+            <div className={`track-row ${track.virtual ? 'virtual' : ''} ${track.locked ? 'locked' : ''} ${track.hidden ? 'track-hidden' : ''}`} key={track.id}>
+              <div className="track-label">
+                {renamingTrackId === track.id && !track.virtual ? (
+                  <input
+                    autoFocus
+                    defaultValue={track.name}
+                    aria-label="Nombre de pista"
+                    onBlur={(event) => { props.onUpdateTrack(track.id, { name: event.target.value.trim() || track.name }); setRenamingTrackId(undefined); }}
+                    onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); if (event.key === 'Escape') { event.currentTarget.value = track.name; event.currentTarget.blur(); } }}
+                  />
+                ) : <span title="Doble clic para renombrar" onDoubleClick={() => !track.virtual && setRenamingTrackId(track.id)}>{track.name}</span>}
+                {!track.virtual ? (
+                  <div className="track-controls">
+                    <button title={track.locked ? 'Desbloquear pista' : 'Bloquear pista'} onClick={() => props.onUpdateTrack(track.id, { locked: !track.locked })}>{track.locked ? <Lock size={13} /> : <Unlock size={13} />}</button>
+                    <button title={track.hidden ? 'Mostrar pista' : 'Ocultar pista'} onClick={() => props.onUpdateTrack(track.id, { hidden: !track.hidden })}>{track.hidden ? <EyeOff size={13} /> : <Eye size={13} />}</button>
+                    {track.kind !== 'text' ? <button title={track.muted ? 'Activar sonido' : 'Silenciar pista'} onClick={() => props.onUpdateTrack(track.id, { muted: !track.muted })}>{track.muted ? <VolumeX size={13} /> : <Volume2 size={13} />}</button> : null}
+                    <button title="Subir pista" onClick={() => props.onReorderTrack(track.id, -1)}><ArrowUp size={13} /></button>
+                    <button title="Bajar pista" onClick={() => props.onReorderTrack(track.id, 1)}><ArrowDown size={13} /></button>
+                    <button className="danger" title="Eliminar pista" onClick={() => { if (window.confirm(`Eliminar la pista ${track.name} y todos sus clips?`)) props.onDeleteTrack(track.id); }}><Trash2 size={13} /></button>
+                  </div>
+                ) : null}
+              </div>
               <div
                 className="track-lane timeline-scrub-area"
                 onPointerDown={beginTimelineSelection}
@@ -2720,8 +3186,9 @@ function EditorView(props: {
                         style={{ left: `${left}%`, width: `${width}%` }}
                         role="button"
                         tabIndex={0}
-                        draggable
+                        draggable={!track.locked}
                         onDragStart={(event) => {
+                          if (track.locked) { event.preventDefault(); return; }
                           event.stopPropagation();
                           const bounds = event.currentTarget.getBoundingClientRect();
                           const dragIds = selectedClipIds.includes(clip.id) ? selectedClipIds : [clip.id];
@@ -2744,7 +3211,9 @@ function EditorView(props: {
                         onClick={(event) => selectClip(clip.id, event.ctrlKey || event.metaKey || event.shiftKey)}
                       >
                         <button className="clip-trim-handle start" aria-label="Ajustar inicio" onPointerDown={(event) => beginTrim(event, clip, 'start')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
-                        <span>{clip.type === 'text' ? (clip.text || 'Texto') : (asset?.name || clip.type)}</span>
+                        {clip.transition?.type && clip.transition.type !== 'none' ? <span className={`clip-transition ${clip.transition.type}`} style={{ width: `${Math.min(100, (clip.transition.duration / Math.max(0.01, clip.duration)) * 100)}%` }} title={`${clip.transition.type} ${clip.transition.duration}s`} /> : null}
+                        {asset?.kind === 'video' && videoThumbnails[asset.id]?.length ? <span className="clip-thumbnail-strip">{videoThumbnails[asset.id].map((frame, index) => <img key={`${asset.id}_${index}`} src={frame} alt="" draggable={false} />)}</span> : null}
+                        <span className="clip-title">{clip.type === 'text' ? (clip.text || 'Texto') : (asset?.name || clip.type)}</span>
                         <button className="clip-trim-handle end" aria-label="Ajustar final" onPointerDown={(event) => beginTrim(event, clip, 'end')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
                       </div>
                     );

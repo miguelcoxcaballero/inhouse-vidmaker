@@ -44,15 +44,34 @@ export function defaultTransform(): TransformRecord {
     y: 0,
     scale: 1,
     rotation: 0,
-    opacity: 100
+    opacity: 100,
+    cropX: 0,
+    cropY: 0,
+    cropWidth: 100,
+    cropHeight: 100,
+    flipX: false,
+    flipY: false,
+    fit: 'contain'
+  };
+}
+
+export function defaultTextStyle() {
+  return {
+    fontFamily: 'DM Sans',
+    fontSize: 64,
+    color: '#ffffff',
+    align: 'center' as const,
+    backgroundColor: '#000000',
+    backgroundOpacity: 0,
+    animation: 'none' as const
   };
 }
 
 export function createDefaultTracks(): TimelineTrack[] {
   return [
-    { id: 'track_text', name: 'Texto', kind: 'text', locked: false, muted: false },
-    { id: 'track_video_1', name: 'Video 1', kind: 'video', locked: false, muted: false },
-    { id: 'track_audio_1', name: 'Audio 1', kind: 'audio', locked: false, muted: false }
+    { id: 'track_text', name: 'Texto', kind: 'text', locked: false, muted: false, hidden: false },
+    { id: 'track_video_1', name: 'Video 1', kind: 'video', locked: false, muted: false, hidden: false },
+    { id: 'track_audio_1', name: 'Audio 1', kind: 'audio', locked: false, muted: false, hidden: false }
   ];
 }
 
@@ -82,8 +101,17 @@ export function sanitizeProjectName(value: string): string {
 
 export function normalizeLoadedProject(raw: Partial<ProjectRecord>): ProjectRecord {
   const fallback = createEmptyProject(raw.name || 'nuevo video');
-  const tracks = Array.isArray(raw.tracks) && raw.tracks.length ? [...raw.tracks] : createDefaultTracks();
-  const timeline = Array.isArray(raw.timeline) ? raw.timeline.map((clip) => ({ ...clip })) : [];
+  const tracks = Array.isArray(raw.tracks) && raw.tracks.length
+    ? raw.tracks.map((track) => ({ ...track, hidden: !!track.hidden }))
+    : createDefaultTracks();
+  const timeline: TimelineItem[] = Array.isArray(raw.timeline) ? raw.timeline.map((clip): TimelineItem => ({
+    ...clip,
+    transform: { ...defaultTransform(), ...(clip.transform || {}) },
+    textStyle: clip.type === 'text' ? { ...defaultTextStyle(), ...(clip.textStyle || {}) } : clip.textStyle,
+    transition: { type: 'none' as const, duration: 0.5, ...(clip.transition || {}) },
+    playbackRate: Math.min(8, Math.max(0.1, Number(clip.playbackRate) || 1)),
+    reverse: !!clip.reverse
+  })) : [];
   const assigned = new Map<string, TimelineItem[]>();
   const trackKindForClip = (clip: TimelineItem) => clip.type === 'audio' ? 'audio' : clip.type === 'text' ? 'text' : 'video';
   timeline
@@ -102,7 +130,8 @@ export function normalizeLoadedProject(raw: Partial<ProjectRecord>): ProjectReco
           name: `${kind === 'video' ? 'Video' : kind === 'audio' ? 'Audio' : 'Texto'} ${count}`,
           kind,
           locked: false,
-          muted: false
+          muted: false,
+          hidden: false
         };
         tracks.push(target);
       }

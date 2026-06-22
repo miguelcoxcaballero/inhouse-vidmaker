@@ -55,6 +55,28 @@ export interface TransformRecord {
   scale: number;
   rotation: number;
   opacity: number;
+  cropX: number;
+  cropY: number;
+  cropWidth: number;
+  cropHeight: number;
+  flipX: boolean;
+  flipY: boolean;
+  fit: 'contain' | 'cover';
+}
+
+export interface TextStyleRecord {
+  fontFamily: string;
+  fontSize: number;
+  color: string;
+  align: 'left' | 'center' | 'right';
+  backgroundColor: string;
+  backgroundOpacity: number;
+  animation: 'none' | 'fade' | 'slide-up' | 'typewriter';
+}
+
+export interface TransitionRecord {
+  type: 'none' | 'fade' | 'dissolve' | 'slide';
+  duration: number;
 }
 
 export interface TimelineItem {
@@ -68,6 +90,10 @@ export interface TimelineItem {
   trimEnd?: number;
   text?: string;
   transform: TransformRecord;
+  textStyle?: TextStyleRecord;
+  transition?: TransitionRecord;
+  playbackRate?: number;
+  reverse?: boolean;
 }
 
 export interface TimelineTrack {
@@ -76,6 +102,7 @@ export interface TimelineTrack {
   kind: 'video' | 'audio' | 'text';
   locked: boolean;
   muted: boolean;
+  hidden: boolean;
 }
 
 export interface ProjectRecord {
