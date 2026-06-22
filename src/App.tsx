@@ -31,7 +31,6 @@ import {
   Redo2
 } from 'lucide-react';
 import { ChangeEvent, CSSProperties, DragEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { AudioSource, ImageSource, VideoSource } from '@diffusionstudio/core';
 import { createDriveClient } from './drive';
 import { DRIVE_SYNC_DEBOUNCE_MS, PROJECT_APP_PROPERTY, PROJECT_FILE_NAME, PROJECT_FOLDER_PROPERTY } from './constants';
 import { loadStoredState, persistStoredState } from './storage';
@@ -71,8 +70,6 @@ function getDefaultSidePanelWidth() {
 function getDefaultTimelineHeight() {
   return clamp((window.innerHeight - 64) * 0.34, 190, 430);
 }
-
-type DiffusionCore = typeof import('@diffusionstudio/core');
 
 type BinEntry = {
   id: string;
@@ -884,96 +881,10 @@ export function App() {
       if (missingAssets.length) throw new Error('Hay archivos de la timeline que no estan disponibles localmente. Recarga el proyecto antes de exportar.');
       setExportProgress(0);
       setToast('Preparando exportacion...');
-      const core: DiffusionCore = await import('@diffusionstudio/core');
-      const composition = new core.Composition({
-        width: activeProject.width,
-        height: activeProject.height,
-        background: '#000000'
-      });
-      const sourceCache = new Map<string, VideoSource | ImageSource | AudioSource>();
-      const getSource = async (asset: AssetRecord) => {
-        const cached = sourceCache.get(asset.id);
-        if (cached) return cached;
-        if (!asset.objectUrl) throw new Error(`No se puede cargar ${asset.name}.`);
-        let source: VideoSource | ImageSource | AudioSource;
-        if (asset.kind === 'video') source = await core.Source.from<VideoSource>(asset.objectUrl, { name: asset.name, mimeType: asset.mimeType });
-        else if (asset.kind === 'image') source = await core.Source.from<ImageSource>(asset.objectUrl, { name: asset.name, mimeType: asset.mimeType });
-        else source = await core.Source.from<AudioSource>(asset.objectUrl, { name: asset.name, mimeType: asset.mimeType });
-        sourceCache.set(asset.id, source);
-        return source;
-      };
-      const visualProps = (clip: TimelineItem, asset?: AssetRecord) => {
-        const projectRatio = activeProject.width / activeProject.height;
-        const assetRatio = asset?.width && asset.height ? asset.width / asset.height : projectRatio;
-        const width = assetRatio >= projectRatio ? activeProject.width : activeProject.height * assetRatio;
-        const height = assetRatio >= projectRatio ? activeProject.width / assetRatio : activeProject.height;
-        return {
-          delay: clip.start,
-          duration: clip.duration,
-          x: activeProject.width * (0.5 + clip.transform.x / 100),
-          y: activeProject.height * (0.5 + clip.transform.y / 100),
-          width,
-          height,
-          scale: clip.transform.scale,
-          rotation: clip.transform.rotation,
-          opacity: clip.transform.opacity / 100,
-          keepAspectRatio: true
-        };
-      };
-
-      for (const track of activeProject.tracks) {
-        const timelineClips = activeProject.timeline
-          .filter((clip) => clip.trackId === track.id)
-          .sort((a, b) => a.start - b.start);
-        if (!timelineClips.length) continue;
-        const layer = new core.Layer({ mode: 'DEFAULT' });
-        await composition.add(layer, composition.layers.length);
-        for (const clip of timelineClips) {
-          if (clip.type === 'text') {
-            await layer.add(new core.TextClip({
-              ...visualProps(clip),
-              text: clip.text || '',
-              fontSize: 64,
-              color: '#ffffff',
-              align: 'center',
-              baseline: 'middle',
-              maxWidth: activeProject.width * 0.9
-            }));
-            continue;
-          }
-          const asset = activeProject.assets.find((item) => item.id === clip.assetId);
-          if (!asset) continue;
-          const source = await getSource(asset);
-          const range: [number, number] = [clip.trimStart || 0, (clip.trimStart || 0) + clip.duration];
-          if (clip.type === 'video') {
-            await layer.add(new core.VideoClip(source as VideoSource, {
-              ...visualProps(clip, asset),
-              range,
-              muted: track.muted
-            }));
-          } else if (clip.type === 'image') {
-            await layer.add(new core.ImageClip(source as ImageSource, visualProps(clip, asset)));
-          } else {
-            await layer.add(new core.AudioClip(source as AudioSource, {
-              delay: clip.start,
-              duration: clip.duration,
-              range,
-              muted: track.muted
-            }));
-          }
-        }
-      }
-      const encoder = new core.Encoder(composition, {
-        video: { fps: activeProject.fps, codec: 'avc', bitrate: 8e6, resolution: 1 },
-        audio: { enabled: true, codec: 'aac', bitrate: 192e3 },
-        range: { end: activeProject.duration }
-      });
-      encoder.onProgress = ({ progress, total }) => setExportProgress(total ? Math.round((progress / total) * 100) : 0);
+      const { renderProjectToMp4 } = await import('./exportVideo');
+      const exportedVideo = await renderProjectToMp4(activeProject, { onProgress: setExportProgress });
       const renderName = `${activeProject.name.replace(/[^\w.-]+/g, '_') || 'inhouse_vidmaker'}.mp4`;
-      const result = await encoder.render();
-      if (result.type === 'error') throw result.error;
-      if (result.type !== 'success' || !result.data) throw new Error('El navegador no devolvio el archivo exportado.');
-      const url = URL.createObjectURL(result.data);
+      const url = URL.createObjectURL(exportedVideo);
       const download = document.createElement('a');
       download.href = url;
       download.download = renderName;

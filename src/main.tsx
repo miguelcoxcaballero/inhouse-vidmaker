@@ -3,11 +3,13 @@ import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import './styles.css';
 
-if ('serviceWorker' in navigator && import.meta.env.PROD && !window.crossOriginIsolated) {
-  navigator.serviceWorker.register(`${import.meta.env.BASE_URL}coi-serviceworker.js`).then(() => {
-    if (navigator.serviceWorker.controller) return;
-    navigator.serviceWorker.addEventListener('controllerchange', () => window.location.reload(), { once: true });
-  }).catch((error) => console.warn('Export isolation could not be enabled.', error));
+if ('serviceWorker' in navigator) {
+  void navigator.serviceWorker.getRegistrations().then(async (registrations) => {
+    const legacy = registrations.filter((registration) => registration.active?.scriptURL.endsWith('/coi-serviceworker.js'));
+    if (!legacy.length) return;
+    await Promise.all(legacy.map((registration) => registration.unregister()));
+    if (navigator.serviceWorker.controller?.scriptURL.endsWith('/coi-serviceworker.js')) window.location.reload();
+  });
 }
 
 createRoot(document.getElementById('root')!).render(

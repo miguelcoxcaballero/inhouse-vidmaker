@@ -6,16 +6,6 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
-    host: '0.0.0.0',
-    headers: {
-      'Cross-Origin-Embedder-Policy': 'credentialless',
-      'Cross-Origin-Opener-Policy': 'same-origin'
-    }
-  },
-  preview: {
-    headers: {
-      'Cross-Origin-Embedder-Policy': 'credentialless',
-      'Cross-Origin-Opener-Policy': 'same-origin'
-    }
+    host: '0.0.0.0'
   }
 });

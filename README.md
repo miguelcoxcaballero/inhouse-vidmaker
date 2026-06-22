@@ -1,6 +1,6 @@
 # inhouse vidmaker
 
-Editor de video web con Home tipo Drive inspirado en `inhouse notes`, proyectos con autoguardado local/Drive y editor básico con assets, timeline, texto y exportación con Diffusion Studio.
+Editor de video web con Home tipo Drive inspirado en `inhouse notes`, proyectos con autoguardado local/Drive y editor básico con assets, timeline, texto y exportación MP4 local.
 
 ## Ejecutar
 
