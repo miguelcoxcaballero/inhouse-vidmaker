@@ -50,7 +50,7 @@ import {
 } from 'lucide-react';
 import { ChangeEvent, CSSProperties, DragEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createDriveClient } from './drive';
-import { DRIVE_SYNC_DEBOUNCE_MS, PROJECT_APP_PROPERTY, PROJECT_FILE_NAME, PROJECT_FOLDER_PROPERTY } from './constants';
+import { DRIVE_SYNC_DEBOUNCE_MS, PREVIEWS_FILE_NAME, PROJECT_APP_PROPERTY, PROJECT_FILE_NAME, PROJECT_FOLDER_PROPERTY } from './constants';
 import { loadStoredState, persistStoredState } from './storage';
 import type { AssetRecord, DriveClient, DriveFolder, DriveProjectFile, FolderPickerResult, ProjectRecord, SaveStatus, TimelineItem, TimelineTrack } from './types';
 import {
@@ -434,6 +434,14 @@ export function App() {
   const assetThumbnailPromisesRef = useRef(new Map<string, Promise<boolean>>());
   const homeThumbnailJobRef = useRef<string | undefined>(undefined);
   const homeThumbnailFailuresRef = useRef(new Set<string>());
+  // Cached timeline filmstrip frames (assetId -> frames) for the open project. Persisted
+  // to a per-project previews.json on Drive so they don't get regenerated from the media
+  // every session.
+  const [videoFrames, setVideoFrames] = useState<Record<string, string[]>>({});
+  const videoFramesRef = useRef<Record<string, string[]>>({});
+  const previewsLoadedProjectRef = useRef<string | undefined>(undefined);
+  const previewsSaveTimerRef = useRef<number | null>(null);
+  const previewsDirtyRef = useRef(false);
 
   const activeProject = useMemo(
     () => projects.find((project) => project.id === activeProjectId),
@@ -581,6 +589,64 @@ export function App() {
     });
     if (recordHistory) setHistoryVersion((version) => version + 1);
   }, [activeProjectId]);
+
+  const savePreviews = useCallback(async () => {
+    const project = activeProjectRef.current;
+    if (!project || !drive.accessToken || !previewsDirtyRef.current) return;
+    const folderId = project.thumbsFolderId || project.folderId;
+    if (!folderId) return;
+    previewsDirtyRef.current = false;
+    const payload = { version: 1 as const, frames: videoFramesRef.current };
+    try {
+      if (project.previewsFileId) {
+        await drive.patchJson(project.previewsFileId, payload);
+      } else {
+        const file = await drive.uploadJson(PREVIEWS_FILE_NAME, payload, folderId);
+        patchActiveProject((current) => ({ ...current, previewsFileId: file.id }), false);
+      }
+    } catch {
+      previewsDirtyRef.current = true;
+    }
+  }, [drive, patchActiveProject]);
+
+  const schedulePreviewsSave = useCallback(() => {
+    previewsDirtyRef.current = true;
+    if (previewsSaveTimerRef.current) window.clearTimeout(previewsSaveTimerRef.current);
+    previewsSaveTimerRef.current = window.setTimeout(() => { void savePreviews(); }, 2000);
+  }, [savePreviews]);
+
+  const setVideoFramesFor = useCallback((assetId: string, frames: string[]) => {
+    if (!frames.length) return;
+    videoFramesRef.current = { ...videoFramesRef.current, [assetId]: frames };
+    setVideoFrames((current) => ({ ...current, [assetId]: frames }));
+    schedulePreviewsSave();
+  }, [schedulePreviewsSave]);
+
+  // Load the cached filmstrip frames for the open project, so the timeline doesn't have
+  // to re-download and re-seek every video each time the project is opened.
+  useEffect(() => {
+    if (previewsLoadedProjectRef.current === activeProjectId) return;
+    previewsLoadedProjectRef.current = activeProjectId;
+    if (previewsSaveTimerRef.current) window.clearTimeout(previewsSaveTimerRef.current);
+    previewsDirtyRef.current = false;
+    videoFramesRef.current = {};
+    setVideoFrames({});
+    const project = activeProjectRef.current;
+    if (!activeProjectId || !project?.previewsFileId || !drive.accessToken) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const data = await drive.downloadJson<{ frames?: Record<string, string[]> }>(project.previewsFileId!);
+        if (cancelled || activeProjectRef.current?.id !== project.id) return;
+        const frames = data?.frames && typeof data.frames === 'object' ? data.frames : {};
+        videoFramesRef.current = frames;
+        setVideoFrames(frames);
+      } catch {
+        /* a missing previews file just means we'll regenerate on demand */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeProjectId, drive]);
 
   useEffect(() => {
     undoStackRef.current = [];
@@ -1477,6 +1543,8 @@ export function App() {
         onEnsureAssetLoaded={ensureAssetLoaded}
         onEnsureAssetThumbnail={ensureAssetThumbnail}
         onSetAssetThumbnail={setAssetThumbnail}
+        videoFrames={videoFrames}
+        onSetVideoFrames={setVideoFramesFor}
         onRetryAsset={retryAsset}
         onDragOver={onDragOver}
         onDragLeave={() => setDragging(false)}
@@ -2435,6 +2503,8 @@ function EditorView(props: {
   onEnsureAssetLoaded(assetId: string, quiet?: boolean): Promise<void>;
   onEnsureAssetThumbnail(assetId: string): Promise<boolean>;
   onSetAssetThumbnail(assetId: string, thumbnailDataUrl: string): void;
+  videoFrames: Record<string, string[]>;
+  onSetVideoFrames(assetId: string, frames: string[]): void;
   onRetryAsset(assetId: string): void;
   onDragOver(event: DragEvent<HTMLElement>): void;
   onDragLeave(): void;
@@ -2482,7 +2552,9 @@ function EditorView(props: {
   const [shortcutsEnabled, setShortcutsEnabled] = useState(true);
   const [mobilePanel, setMobilePanel] = useState<'assets' | 'preview' | 'inspector'>('preview');
   const [renamingTrackId, setRenamingTrackId] = useState<string | undefined>();
-  const [videoThumbnails, setVideoThumbnails] = useState<Record<string, string[]>>({});
+  // Filmstrip frames come from the parent (cached/persisted there) so they survive
+  // re-opening the project without regenerating from the media.
+  const videoThumbnails = props.videoFrames;
   const [thumbnailQueueVersion, setThumbnailQueueVersion] = useState(0);
   const [assetPanelWidth, setAssetPanelWidth] = useState(getDefaultSidePanelWidth);
   const [inspectorPanelWidth, setInspectorPanelWidth] = useState(getDefaultSidePanelWidth);
@@ -2689,19 +2761,20 @@ function EditorView(props: {
       if (index === 0 && !postered) {
         postered = true;
         if (!asset.thumbnailDataUrl) props.onSetAssetThumbnail(asset.id, dataUrl);
-        if (editorMountedRef.current) setVideoThumbnails((current) => ({ ...current, [asset.id]: [dataUrl] }));
+        if (editorMountedRef.current) props.onSetVideoFrames(asset.id, [dataUrl]);
       }
     }).then((frames) => {
       if (!frames.length) thumbnailFailuresRef.current.add(asset.id);
       if (frames[0] && !asset.thumbnailDataUrl) props.onSetAssetThumbnail(asset.id, frames[0]);
-      if (editorMountedRef.current) setVideoThumbnails((current) => frames.length ? { ...current, [asset.id]: frames } : { ...current });
+      if (editorMountedRef.current && frames.length) props.onSetVideoFrames(asset.id, frames);
     }).catch(() => {
       thumbnailFailuresRef.current.add(asset.id);
-      if (editorMountedRef.current) setVideoThumbnails((current) => ({ ...current }));
     }).finally(() => {
       thumbnailJobRef.current = undefined;
+      // Advance the queue (a successful run already re-runs via videoFrames changing).
+      if (editorMountedRef.current) setThumbnailQueueVersion((version) => version + 1);
     });
-  }, [props.project.assets, videoThumbnails]);
+  }, [props.project.assets, videoThumbnails, thumbnailQueueVersion]);
 
   // Generate (and persist) thumbnails for images that have a loaded copy but no
   // thumbnail yet — covers freshly added images and ones reopened from Drive.

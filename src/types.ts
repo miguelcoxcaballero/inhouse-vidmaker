@@ -114,6 +114,7 @@ export interface ProjectRecord {
   assetsFolderId?: string;
   rendersFolderId?: string;
   thumbsFolderId?: string;
+  previewsFileId?: string;
   trashedAt?: string;
   createdAt: string;
   updatedAt: string;

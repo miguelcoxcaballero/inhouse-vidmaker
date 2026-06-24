@@ -4,6 +4,7 @@ export const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive';
 export const STORAGE_KEY = 'inhouseVidmakerStateV1';
 export const TOKEN_STORAGE_KEY = STORAGE_KEY + '::token';
 export const PROJECT_FILE_NAME = 'project.ihvideo.json';
+export const PREVIEWS_FILE_NAME = 'previews.ihvideo.json';
 export const PROJECT_APP_PROPERTY = 'inhouseVidmakerProject';
 export const PROJECT_FOLDER_PROPERTY = 'inhouseVidmakerFolder';
 export const DRIVE_SYNC_DEBOUNCE_MS = 900;
