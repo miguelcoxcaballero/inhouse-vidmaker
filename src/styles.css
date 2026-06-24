@@ -1524,6 +1524,14 @@ button {
   filter: drop-shadow(0 1px 4px #000);
 }
 
+/* The spinner rotates via transform, so it can't also use transform to centre —
+   centre it with auto margins instead and let the rotation own the transform. */
+.preview-spinner.asset-loading {
+  inset: 0;
+  margin: auto;
+  transform: none;
+}
+
 .asset-thumbnail img,
 .asset-thumbnail video {
   width: 100%;
