@@ -2,6 +2,7 @@ import {
   ArrowLeft,
   ArrowDown,
   ArrowUp,
+  Camera,
   ChevronDown,
   ChevronRight,
   Download,
@@ -22,6 +23,8 @@ import {
   Lock,
   Maximize2,
   Minus,
+  Mic,
+  MicOff,
   MoreVertical,
   Music,
   Pause,
@@ -32,6 +35,7 @@ import {
   RotateCcw,
   Scissors,
   Search,
+  Square,
   Trash2,
   Type,
   Undo2,
@@ -41,7 +45,8 @@ import {
   Video,
   Redo2,
   Volume2,
-  VolumeX
+  VolumeX,
+  X
 } from 'lucide-react';
 import { ChangeEvent, CSSProperties, DragEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createDriveClient } from './drive';
@@ -1803,6 +1808,232 @@ function FolderPicker(props: {
   );
 }
 
+function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): void }) {
+  const [mode, setMode] = useState<'video' | 'photo'>('video');
+  const [cameraId, setCameraId] = useState('');
+  const [microphoneId, setMicrophoneId] = useState('');
+  const [audioEnabled, setAudioEnabled] = useState(true);
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+  const [connectionState, setConnectionState] = useState<'connecting' | 'ready' | 'error'>('connecting');
+  const [error, setError] = useState('');
+  const [recording, setRecording] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [retryVersion, setRetryVersion] = useState(0);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const recordingStartedAtRef = useRef(0);
+  const discardRecordingRef = useRef(false);
+  const cameras = devices.filter((device) => device.kind === 'videoinput');
+  const microphones = devices.filter((device) => device.kind === 'audioinput');
+
+  useEffect(() => {
+    let disposed = false;
+    const connect = async () => {
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+      setConnectionState('connecting');
+      setError('');
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setConnectionState('error');
+        setError('Este navegador no permite usar la camara desde la web.');
+        return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: cameraId
+            ? { deviceId: { exact: cameraId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+            : { facingMode: 'user', width: { ideal: 1920 }, height: { ideal: 1080 } },
+          audio: mode === 'video' && audioEnabled
+            ? (microphoneId ? { deviceId: { exact: microphoneId }, echoCancellation: true, noiseSuppression: true } : { echoCancellation: true, noiseSuppression: true })
+            : false
+        });
+        if (disposed) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        streamRef.current = stream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play().catch(() => undefined);
+        }
+        const available = await navigator.mediaDevices.enumerateDevices();
+        if (disposed) return;
+        setDevices(available);
+        const activeCamera = stream.getVideoTracks()[0]?.getSettings().deviceId;
+        const activeMicrophone = stream.getAudioTracks()[0]?.getSettings().deviceId;
+        if (!cameraId && activeCamera) setCameraId(activeCamera);
+        if (!microphoneId && activeMicrophone) setMicrophoneId(activeMicrophone);
+        setConnectionState('ready');
+      } catch (reason) {
+        if (disposed) return;
+        const name = reason instanceof DOMException ? reason.name : '';
+        setConnectionState('error');
+        setError(name === 'NotAllowedError'
+          ? 'Permite el acceso a la camara y al microfono en el navegador.'
+          : name === 'NotFoundError'
+            ? 'No se ha encontrado una camara o microfono disponible.'
+            : 'No se pudo iniciar la camara. Comprueba que otra aplicacion no la este usando.');
+      }
+    };
+    void connect();
+    return () => {
+      disposed = true;
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    };
+  }, [audioEnabled, cameraId, microphoneId, mode, retryVersion]);
+
+  useEffect(() => {
+    if (!recording) return;
+    const timer = window.setInterval(() => setElapsed((Date.now() - recordingStartedAtRef.current) / 1000), 200);
+    return () => window.clearInterval(timer);
+  }, [recording]);
+
+  useEffect(() => {
+    if (!navigator.mediaDevices?.addEventListener) return;
+    const refreshDevices = () => { void navigator.mediaDevices.enumerateDevices().then(setDevices).catch(() => undefined); };
+    navigator.mediaDevices.addEventListener('devicechange', refreshDevices);
+    return () => navigator.mediaDevices.removeEventListener('devicechange', refreshDevices);
+  }, []);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !recording) props.onClose();
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [props.onClose, recording]);
+
+  const finishCapture = (file: File) => {
+    props.onCapture(file);
+    props.onClose();
+  };
+
+  const takePhoto = async () => {
+    const video = videoRef.current;
+    if (!video || video.videoWidth < 1 || video.videoHeight < 1) return;
+    setSaving(true);
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext('2d');
+    context?.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.94));
+    if (!blob) {
+      setSaving(false);
+      setError('No se pudo crear la foto.');
+      return;
+    }
+    finishCapture(new File([blob], `foto_${new Date().toISOString().replace(/[:.]/g, '-')}.jpg`, { type: 'image/jpeg' }));
+  };
+
+  const startRecording = () => {
+    const stream = streamRef.current;
+    if (!stream || typeof MediaRecorder === 'undefined') {
+      setError('La grabacion de video no esta disponible en este navegador.');
+      return;
+    }
+    const preferredTypes = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
+    const mimeType = preferredTypes.find((type) => MediaRecorder.isTypeSupported(type)) || '';
+    try {
+      chunksRef.current = [];
+      discardRecordingRef.current = false;
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      recorderRef.current = recorder;
+      recorder.ondataavailable = (event) => { if (event.data.size) chunksRef.current.push(event.data); };
+      recorder.onerror = () => {
+        setRecording(false);
+        setError('La grabacion se ha interrumpido.');
+      };
+      recorder.onstop = () => {
+        setRecording(false);
+        if (discardRecordingRef.current) return;
+        const type = recorder.mimeType || mimeType || 'video/webm';
+        const blob = new Blob(chunksRef.current, { type });
+        if (!blob.size) {
+          setError('La grabacion esta vacia. Intentalo de nuevo.');
+          return;
+        }
+        setSaving(true);
+        const extension = type.includes('mp4') ? 'mp4' : 'webm';
+        finishCapture(new File([blob], `video_${new Date().toISOString().replace(/[:.]/g, '-')}.${extension}`, { type }));
+      };
+      recordingStartedAtRef.current = Date.now();
+      setElapsed(0);
+      setRecording(true);
+      recorder.start(250);
+    } catch {
+      setError('No se pudo comenzar la grabacion.');
+    }
+  };
+
+  const stopRecording = () => {
+    const recorder = recorderRef.current;
+    if (recorder?.state === 'recording') recorder.stop();
+  };
+
+  const requestClose = () => {
+    if (recording) return;
+    discardRecordingRef.current = true;
+    props.onClose();
+  };
+
+  return (
+    <div className="capture-overlay" role="presentation" onPointerDown={(event) => { if (event.target === event.currentTarget) requestClose(); }}>
+      <section className="capture-modal" role="dialog" aria-modal="true" aria-labelledby="capture-title">
+        <header className="capture-header">
+          <div><h2 id="capture-title">Camara</h2><span>Captura directamente en este proyecto</span></div>
+          <button className="btn btn-secondary btn-icon-square" disabled={recording} title="Cerrar" aria-label="Cerrar" onClick={requestClose}><X size={18} /></button>
+        </header>
+        <div className="capture-mode" aria-label="Tipo de captura">
+          <button className={mode === 'video' ? 'active' : ''} disabled={recording || saving} onClick={() => setMode('video')}><Video size={16} /> Video</button>
+          <button className={mode === 'photo' ? 'active' : ''} disabled={recording || saving} onClick={() => setMode('photo')}><Camera size={16} /> Foto</button>
+        </div>
+        <div className="capture-body">
+          <div className="capture-preview">
+            <video ref={videoRef} muted playsInline autoPlay />
+            {connectionState === 'connecting' ? <div className="capture-state"><Loader2 className="spin" size={28} /><span>Iniciando camara...</span></div> : null}
+            {connectionState === 'error' ? <div className="capture-state error"><Camera size={30} /><span>{error}</span><button className="btn btn-secondary" onClick={() => setRetryVersion((value) => value + 1)}><RefreshCw size={15} /> Reintentar</button></div> : null}
+            {recording ? <div className="capture-recording"><span /> REC {Math.floor(elapsed / 60).toString().padStart(2, '0')}:{Math.floor(elapsed % 60).toString().padStart(2, '0')}</div> : null}
+          </div>
+          <div className="capture-settings">
+            <label>Camara
+              <select value={cameraId} disabled={recording || connectionState === 'connecting'} onChange={(event) => setCameraId(event.target.value)}>
+                {cameras.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camara ${index + 1}`}</option>)}
+              </select>
+            </label>
+            <label>Microfono
+              <select value={microphoneId} disabled={recording || mode === 'photo' || !audioEnabled || connectionState === 'connecting'} onChange={(event) => setMicrophoneId(event.target.value)}>
+                {microphones.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Microfono ${index + 1}`}</option>)}
+              </select>
+            </label>
+            <label className={`capture-audio-toggle ${audioEnabled && mode === 'video' ? 'active' : ''}`}>
+              <input type="checkbox" checked={audioEnabled} disabled={recording || mode === 'photo'} onChange={(event) => setAudioEnabled(event.target.checked)} />
+              {audioEnabled && mode === 'video' ? <Mic size={17} /> : <MicOff size={17} />}
+              Grabar audio
+            </label>
+            {error && connectionState !== 'error' ? <div className="capture-inline-error">{error}</div> : null}
+          </div>
+        </div>
+        <footer className="capture-footer">
+          <span>{mode === 'photo' ? 'JPG' : 'Video con el audio seleccionado'}</span>
+          {mode === 'photo' ? (
+            <button className="capture-shutter" disabled={connectionState !== 'ready' || saving} title="Hacer foto" aria-label="Hacer foto" onClick={() => void takePhoto()}><span /></button>
+          ) : recording ? (
+            <button className="capture-stop" title="Detener grabacion" aria-label="Detener grabacion" onClick={stopRecording}><Square size={19} fill="currentColor" /></button>
+          ) : (
+            <button className="capture-record" disabled={connectionState !== 'ready' || saving} title="Grabar video" aria-label="Grabar video" onClick={startRecording}><span /></button>
+          )}
+          <span>{saving ? 'Guardando...' : 'Se subira a Drive automaticamente'}</span>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
 function EditorView(props: {
   project: ProjectRecord;
   profile: ReturnType<typeof createDriveClient>['profile'];
@@ -1858,6 +2089,7 @@ function EditorView(props: {
   const [assetFolderName, setAssetFolderName] = useState('');
   const [movingAssetId, setMovingAssetId] = useState<string | undefined>();
   const [showAssetBin, setShowAssetBin] = useState(false);
+  const [cameraOpen, setCameraOpen] = useState(false);
   const [rippleEnabled, setRippleEnabled] = useState(true);
   const [shortcutsEnabled, setShortcutsEnabled] = useState(true);
   const [mobilePanel, setMobilePanel] = useState<'assets' | 'preview' | 'inspector'>('preview');
@@ -2049,6 +2281,7 @@ function EditorView(props: {
 
   useEffect(() => {
     const handleEditorShortcut = (event: KeyboardEvent) => {
+      if (cameraOpen) return;
       if (!shortcutsEnabled) return;
       const target = event.target as HTMLElement | null;
       if (target?.matches('input, textarea, [contenteditable="true"]')) return;
@@ -2092,7 +2325,7 @@ function EditorView(props: {
     };
     window.addEventListener('keydown', handleEditorShortcut);
     return () => window.removeEventListener('keydown', handleEditorShortcut);
-  }, [playhead, props, rippleEnabled, selectedClipIds, shortcutsEnabled, splittableClipIds.length]);
+  }, [cameraOpen, playhead, props, rippleEnabled, selectedClipIds, shortcutsEnabled, splittableClipIds.length]);
 
   useEffect(() => {
     activeVisualClips.forEach((clip) => {
@@ -3086,6 +3319,7 @@ function EditorView(props: {
         <div className="timeline-toolbar">
           <div className="timeline-actions">
             <button className="btn btn-secondary" onClick={props.onAddText}><Type size={16} /> Texto</button>
+            <button className="btn btn-secondary" onClick={() => setCameraOpen(true)}><Camera size={16} /> Camara</button>
             <div className="history-controls" aria-label="Historial">
               <button className="btn btn-secondary btn-icon-square" title="Deshacer (Ctrl+Z)" aria-label="Deshacer" disabled={!props.canUndo} onClick={props.onUndo}><Undo2 size={17} /></button>
               <button className="btn btn-secondary btn-icon-square" title="Rehacer (Ctrl+Y)" aria-label="Rehacer" disabled={!props.canRedo} onClick={props.onRedo}><Redo2 size={17} /></button>
@@ -3258,6 +3492,7 @@ function EditorView(props: {
         </button>
       </section>
 
+      {cameraOpen ? <CameraCaptureModal onClose={() => setCameraOpen(false)} onCapture={(file) => props.onFiles([file], assetFolderId)} /> : null}
       <input
         ref={props.fileInputRef}
         className="hidden"

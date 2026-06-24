@@ -2466,6 +2466,277 @@ button {
   display: none;
 }
 
+.capture-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 3000;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.58);
+  backdrop-filter: blur(6px);
+}
+
+.capture-modal {
+  width: min(900px, 100%);
+  max-height: calc(100svh - 40px);
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.32);
+  animation: modalIn 180ms ease forwards;
+}
+
+.capture-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px 12px;
+}
+
+.capture-header h2 {
+  font-size: 1rem;
+}
+
+.capture-header span {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-secondary);
+  font-size: 0.76rem;
+}
+
+.capture-mode {
+  display: flex;
+  gap: 2px;
+  padding: 0 18px 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.capture-mode button {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.capture-mode button.active {
+  border-color: var(--accent-orange);
+  color: var(--text-primary);
+}
+
+.capture-body {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  overflow: auto;
+}
+
+.capture-preview {
+  position: relative;
+  min-height: 320px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: #080808;
+}
+
+.capture-preview video {
+  width: 100%;
+  height: 100%;
+  max-height: 62svh;
+  display: block;
+  object-fit: contain;
+  background: #080808;
+}
+
+.capture-state {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  padding: 28px;
+  background: #111;
+  color: rgba(255, 255, 255, 0.78);
+  text-align: center;
+  font-size: 0.84rem;
+}
+
+.capture-state.error {
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.capture-state .btn-secondary {
+  margin-top: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+.capture-recording {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 9px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.68);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.capture-recording > span {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ef4444;
+  animation: capturePulse 1s ease-in-out infinite;
+}
+
+@keyframes capturePulse {
+  50% { opacity: 0.35; }
+}
+
+.capture-settings {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  padding: 18px;
+  border-left: 1px solid var(--border-soft);
+}
+
+.capture-settings > label:not(.capture-audio-toggle) {
+  display: grid;
+  gap: 7px;
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.capture-settings select {
+  width: 100%;
+  min-width: 0;
+  height: 38px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 0 9px;
+  outline: none;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.78rem;
+  text-transform: none;
+}
+
+.capture-settings select:focus {
+  border-color: var(--accent-orange);
+}
+
+.capture-audio-toggle {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.capture-audio-toggle.active {
+  border-color: rgba(224, 122, 60, 0.45);
+  color: var(--accent-orange);
+  background: rgba(224, 122, 60, 0.08);
+}
+
+.capture-audio-toggle input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent-orange);
+}
+
+.capture-inline-error {
+  color: #d43b35;
+  font-size: 0.76rem;
+  line-height: 1.4;
+}
+
+.capture-footer {
+  min-height: 74px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 64px minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  padding: 10px 18px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.capture-footer > span {
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+}
+
+.capture-footer > span:last-child {
+  text-align: right;
+}
+
+.capture-shutter,
+.capture-record,
+.capture-stop {
+  width: 52px;
+  height: 52px;
+  display: grid;
+  place-items: center;
+  justify-self: center;
+  border: 2px solid var(--border-strong);
+  border-radius: 50%;
+  background: transparent;
+  color: #fff;
+}
+
+.capture-shutter > span {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--text-primary);
+}
+
+.capture-record > span {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: #e4473f;
+}
+
+.capture-stop {
+  border-color: #e4473f;
+  background: #e4473f;
+}
+
+.capture-shutter:disabled,
+.capture-record:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .timeline-clip:active {
   cursor: grabbing;
 }
@@ -2529,6 +2800,32 @@ button {
 }
 
 @media (max-width: 920px) {
+  .capture-overlay {
+    padding: 10px;
+  }
+
+  .capture-modal {
+    max-height: calc(100svh - 20px);
+  }
+
+  .capture-body {
+    grid-template-columns: 1fr;
+  }
+
+  .capture-preview {
+    min-height: 220px;
+  }
+
+  .capture-preview video {
+    max-height: 43svh;
+  }
+
+  .capture-settings {
+    grid-template-columns: 1fr 1fr;
+    border-top: 1px solid var(--border-soft);
+    border-left: 0;
+  }
+
   .drive-topbar,
   .editor-topbar {
     padding: 10px 14px;
@@ -2624,6 +2921,31 @@ button {
 }
 
 @media (max-width: 640px) {
+  .capture-header {
+    padding: 13px 14px 10px;
+  }
+
+  .capture-header span,
+  .capture-footer > span {
+    display: none;
+  }
+
+  .capture-mode {
+    padding: 0 14px 9px;
+  }
+
+  .capture-settings {
+    grid-template-columns: 1fr;
+    gap: 11px;
+    padding: 13px 14px;
+  }
+
+  .capture-footer {
+    min-height: 66px;
+    grid-template-columns: 1fr;
+    padding: 7px 14px;
+  }
+
   .drive-brand,
   .logo-button {
     font-size: 0.98rem;

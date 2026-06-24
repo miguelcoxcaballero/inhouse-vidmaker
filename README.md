@@ -37,6 +37,7 @@ El workflow `.github/workflows/deploy.yml` compila y publica `dist` en GitHub Pa
 - Home tipo Drive con topbar, cards, carpetas, perfil, busqueda y modal de ubicacion.
 - Creacion de carpeta de proyecto y `project.ihvideo.json` en Drive.
 - Subida automatica de assets, carga bajo demanda, cache y reintentos.
+- Captura de fotos y video desde la camara, con seleccion de microfono y subida directa a Drive.
 - Timeline multipista con snap, ripple, seleccion multiple, miniaturas, zoom y atajos.
 - Crop, contain/cover, volteo, transformaciones, velocidad y reproduccion inversa.
 - Pistas bloqueables, ocultables, silenciables, reordenables y renombrables.
