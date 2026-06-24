@@ -264,6 +264,37 @@ async function captureVideoThumbnails(objectUrl: string, count = 5, onFrame?: (i
   return frames;
 }
 
+// Resolve a preview thumbnail for a Drive-backed asset: prefer Drive's own generated
+// thumbnail, and if that's missing (common for many video files) download the actual
+// file and build one locally. Returns a data URL or undefined.
+async function resolveAssetThumbnail(drive: DriveClient, asset: AssetRecord): Promise<string | undefined> {
+  if (asset.kind === 'audio' || !asset.driveFileId) return undefined;
+  try {
+    const blob = await drive.downloadThumbnail(asset.driveFileId);
+    if (blob) {
+      const dataUrl = await blobToDataUrl(blob);
+      if (dataUrl) return dataUrl;
+    }
+  } catch {
+    /* fall back to local generation */
+  }
+  try {
+    const blob = await drive.downloadFile(asset.driveFileId);
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      if (asset.kind === 'image') {
+        return (await captureImageThumbnail(objectUrl)) || undefined;
+      }
+      const frames = await captureVideoThumbnails(objectUrl, 5);
+      return frames[0];
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
+  } catch {
+    return undefined;
+  }
+}
+
 function colorWithAlpha(color: string, alpha: number) {
   const hex = color.replace('#', '');
   if (/^[0-9a-f]{6}$/i.test(hex)) {
@@ -401,12 +432,7 @@ export function App() {
     homeThumbnailJobRef.current = jobKey;
     void (async () => {
       try {
-        const blob = await drive.downloadThumbnail(target.asset.driveFileId!);
-        if (!blob) {
-          homeThumbnailFailuresRef.current.add(jobKey);
-          return;
-        }
-        const thumbnailDataUrl = await blobToDataUrl(blob);
+        const thumbnailDataUrl = await resolveAssetThumbnail(drive, target.asset);
         if (!thumbnailDataUrl) {
           homeThumbnailFailuresRef.current.add(jobKey);
           return;
@@ -1732,7 +1758,9 @@ function ProjectCard(props: {
   const [open, setOpen] = useState(false);
   const firstFrameAsset = projectFirstFrameAsset(props.project);
   const previewSource = firstFrameAsset?.thumbnailDataUrl || (firstFrameAsset?.kind === 'image' ? firstFrameAsset.objectUrl : undefined);
-  const previewPending = !previewSource && !!firstFrameAsset;
+  // Only show the loading shimmer when a preview is genuinely on its way (the asset can
+  // be fetched from Drive); otherwise fall back to the duration placeholder.
+  const previewPending = !previewSource && !!firstFrameAsset?.driveFileId;
   return (
     <article className={`drive-card ${props.compact ? 'compact' : ''}`} onDoubleClick={props.onOpen}>
       <button className="drive-card-open" onClick={props.onOpen} aria-label={`Abrir ${props.project.name}`}>
