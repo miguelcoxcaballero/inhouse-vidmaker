@@ -2186,9 +2186,17 @@ function EditorView(props: {
     .sort((a, b) => props.project.tracks.findIndex((track) => track.id === b.trackId) - props.project.tracks.findIndex((track) => track.id === a.trackId));
   const activeAudioClips = props.project.timeline.filter((clip) => clip.type === 'audio' && clip.start <= playhead && playhead < clip.start + clip.duration && !props.project.tracks.find((track) => track.id === clip.trackId)?.hidden);
   const activeAudioAsset = activeAudioClips[0]?.assetId ? props.project.assets.find((asset) => asset.id === activeAudioClips[0].assetId) : undefined;
-  const timelineDisplayDuration = props.project.duration / Math.min(1, timelineZoom);
+  const timelineMediaEnd = props.project.timeline.length
+    ? Math.max(...props.project.timeline.map((clip) => clip.start + clip.duration))
+    : undefined;
+  const timelineBaseDuration = Math.max(props.project.duration, timelineMediaEnd || 0, 1);
+  const timelineDurationWithTail = timelineBaseDuration + clamp(timelineBaseDuration * 0.1, 1, 5);
+  const timelineDisplayDuration = timelineDurationWithTail / Math.min(1, timelineZoom);
   const timelineContentWidth = timelineViewportWidth * Math.max(1, timelineZoom);
   const timelinePixelsPerSecond = timelineContentWidth / Math.max(1, timelineDisplayDuration);
+  const timelineMediaEndPercent = timelineMediaEnd === undefined
+    ? 100
+    : clamp((timelineMediaEnd / Math.max(1, timelineDisplayDuration)) * 100, 0, 100);
   const timelineTickStep = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600].find((step) => step * timelinePixelsPerSecond >= 52) || 3600;
   const visibleSnapTime = timelineDragPreview?.snapTime ?? trimSnapTime ?? playheadSnapTime;
   const selectClip = (clipId: string, additive = false) => {
@@ -2732,7 +2740,7 @@ function EditorView(props: {
     const timeAtCursor = (timelineOffset + cursorX) / Math.max(0.001, timelinePixelsPerSecond);
     const nextZoom = clamp(timelineZoom * Math.exp(-event.deltaY * 0.0015), 0.25, 8);
     const nextContentWidth = timelineViewportWidth * Math.max(1, nextZoom);
-    const nextDisplayDuration = props.project.duration / Math.min(1, nextZoom);
+    const nextDisplayDuration = timelineDurationWithTail / Math.min(1, nextZoom);
     const nextPixelsPerSecond = nextContentWidth / Math.max(1, nextDisplayDuration);
     const nextMaxOffset = Math.max(0, nextContentWidth - timelineViewportWidth);
     setTimelineZoom(nextZoom);
@@ -2743,7 +2751,7 @@ function EditorView(props: {
     const nextZoom = clamp(nextValue, 0.25, 8);
     const centerTime = (timelineOffset + timelineViewportWidth / 2) / Math.max(0.001, timelinePixelsPerSecond);
     const nextContentWidth = timelineViewportWidth * Math.max(1, nextZoom);
-    const nextDisplayDuration = props.project.duration / Math.min(1, nextZoom);
+    const nextDisplayDuration = timelineDurationWithTail / Math.min(1, nextZoom);
     const nextPixelsPerSecond = nextContentWidth / Math.max(1, nextDisplayDuration);
     setTimelineZoom(nextZoom);
     setTimelineOffset(clamp(centerTime * nextPixelsPerSecond - timelineViewportWidth / 2, 0, Math.max(0, nextContentWidth - timelineViewportWidth)));
@@ -2755,7 +2763,7 @@ function EditorView(props: {
     const onWheel = (event: WheelEvent) => handleTimelineWheel(event);
     panel.addEventListener('wheel', onWheel, { passive: false });
     return () => panel.removeEventListener('wheel', onWheel);
-  }, [timelineContentWidth, timelineOffset, timelinePixelsPerSecond, timelineViewportWidth, timelineZoom, props.project.duration]);
+  }, [timelineContentWidth, timelineDurationWithTail, timelineOffset, timelinePixelsPerSecond, timelineViewportWidth, timelineZoom]);
 
   const beginPanelResize = (event: ReactPointerEvent<HTMLElement>, type: 'assets' | 'inspector' | 'timeline') => {
     event.preventDefault();
@@ -3350,6 +3358,7 @@ function EditorView(props: {
           onPointerMove={continueScrub}
         >
           <div className="timeline-ruler-content" style={{ width: timelineContentWidth, transform: `translateX(${-timelineOffset}px)` }}>
+            {timelineMediaEnd !== undefined ? <div className="timeline-after-end ruler" style={{ left: `${timelineMediaEndPercent}%` }} /> : null}
             {Array.from({ length: Math.ceil(timelineDisplayDuration / timelineTickStep) + 1 }).map((_, index) => {
               const tick = index * timelineTickStep;
               return <span key={tick} style={{ left: `${(tick / Math.max(1, timelineDisplayDuration)) * 100}%` }}>{tick}s</span>;
@@ -3408,6 +3417,7 @@ function EditorView(props: {
                 onDrop={(event) => dropOnTrack(event, track.id)}
               >
                 <div className="track-lane-content" style={{ width: timelineContentWidth, transform: `translateX(${-timelineOffset}px)` }}>
+                  {timelineMediaEnd !== undefined ? <div className="timeline-after-end" style={{ left: `${timelineMediaEndPercent}%` }} /> : null}
                   {props.project.timeline.filter((clip) => clip.trackId === track.id).map((clip) => {
                     const asset = clip.assetId ? props.project.assets.find((item) => item.id === clip.assetId) : undefined;
                     const left = (clip.start / Math.max(1, timelineDisplayDuration)) * 100;
