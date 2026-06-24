@@ -3436,7 +3436,14 @@ function EditorView(props: {
                 <span className="asset-folder-preview"><Folder size={26} /></span><strong>{folder.name}</strong><ChevronRight size={16} />
               </button>
             ))}
-            {visibleAssets.map((asset) => (
+            {visibleAssets.map((asset) => {
+              const hasPreview =
+                asset.kind === 'audio'
+                || (asset.kind === 'image' && !!(asset.thumbnailDataUrl || asset.objectUrl))
+                || (asset.kind === 'video' && !!(videoThumbnails[asset.id]?.[0] || asset.thumbnailDataUrl || asset.objectUrl));
+              // The preview is still being prepared and we can actually produce one.
+              const previewLoading = !hasPreview && (!!asset.driveFileId || asset.uploadState === 'uploading');
+              return (
               <div className={`asset-row ${selectedAssetId === asset.id ? 'selected' : ''}`} key={asset.id}>
                 <button
                   className="asset-open-button"
@@ -3458,10 +3465,10 @@ function EditorView(props: {
                     {asset.kind === 'video' && (videoThumbnails[asset.id]?.[0] || asset.thumbnailDataUrl) ? <img src={videoThumbnails[asset.id]?.[0] || asset.thumbnailDataUrl} alt="" draggable={false} /> : null}
                     {asset.objectUrl && asset.kind === 'video' && !videoThumbnails[asset.id]?.[0] && !asset.thumbnailDataUrl ? <video src={asset.objectUrl} muted playsInline preload="auto" draggable={false} onLoadedData={(event) => { const duration = event.currentTarget.duration; event.currentTarget.currentTime = Number.isFinite(duration) && duration > 0.1 ? Math.min(0.15, duration / 2) : 0; }} /> : null}
                     {asset.kind === 'audio' ? <Music size={28} /> : null}
-                    {!asset.objectUrl && !asset.thumbnailDataUrl && asset.kind !== 'audio' ? (
-                      asset.driveFileId ? <span className="thumb-skeleton" /> : (asset.kind === 'video' ? <Video size={28} /> : <ImageIcon size={28} />)
-                    ) : null}
-                    {asset.uploadState === 'uploading' ? <span className="preview-spinner asset-loading" aria-label="Cargando" /> : null}
+                    {!hasPreview && !previewLoading && asset.kind !== 'audio' ? (asset.kind === 'video' ? <Video size={28} /> : <ImageIcon size={28} />) : null}
+                    {/* Show the shimmer and the spinner together until the preview is actually ready. */}
+                    {previewLoading ? <span className="thumb-skeleton" /> : null}
+                    {previewLoading ? <span className="preview-spinner asset-loading" aria-label="Cargando" /> : null}
                   </span>
                   <span className="asset-copy"><strong>{asset.name}</strong><span>{formatBytes(asset.size)} - {asset.uploadState === 'error' ? 'error' : asset.uploadState === 'uploading' ? 'cargando' : 'listo'}</span></span>
                 </button>
@@ -3484,7 +3491,8 @@ function EditorView(props: {
                   </div>
                 ) : null}
               </div>
-            ))}
+              );
+            })}
             {!visibleAssets.length && !visibleAssetFolders.length ? <div className="panel-empty">{showAssetBin ? 'La papelera esta vacia.' : 'Esta carpeta esta vacia.'}</div> : null}
           </div>
         </aside>
