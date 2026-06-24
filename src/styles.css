@@ -2462,6 +2462,11 @@ button {
   object-fit: cover;
 }
 
+.clip-thumbnail-strip.single img {
+  width: 100%;
+  min-width: 100%;
+}
+
 .timeline-clip .clip-title {
   position: relative;
   z-index: 2;

@@ -166,24 +166,42 @@ async function captureVideoThumbnails(objectUrl: string, count = 5): Promise<str
   video.preload = 'auto';
   video.playsInline = true;
   await new Promise<void>((resolve, reject) => {
-    video.onloadedmetadata = () => resolve();
+    if (video.readyState >= 2) resolve();
+    else video.onloadeddata = () => resolve();
     video.onerror = () => reject(new Error('No se pudieron generar miniaturas.'));
+    video.load();
   });
   const canvas = document.createElement('canvas');
   canvas.width = 160;
   canvas.height = 90;
   const context = canvas.getContext('2d');
   if (!context) return [];
-  const duration = Number.isFinite(video.duration) ? video.duration : 0;
+  const seekableEnd = video.seekable.length ? video.seekable.end(video.seekable.length - 1) : 0;
+  const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : seekableEnd;
   const frames: string[] = [];
   for (let index = 0; index < count; index += 1) {
     const time = duration > 0 ? Math.min(duration - 0.01, (duration * (index + 0.5)) / count) : 0;
-    video.currentTime = Math.max(0, time);
     await new Promise<void>((resolve) => {
-      if (video.readyState >= 2 && Math.abs(video.currentTime - time) < 0.02) resolve();
-      else video.onseeked = () => resolve();
+      let complete = false;
+      const finish = () => {
+        if (complete) return;
+        complete = true;
+        window.clearTimeout(timeout);
+        video.onseeked = null;
+        resolve();
+      };
+      const timeout = window.setTimeout(finish, 1200);
+      video.onseeked = finish;
+      video.currentTime = Math.max(0, time);
+      if (video.readyState >= 2 && Math.abs(video.currentTime - time) < 0.02) finish();
     });
-    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    context.fillStyle = '#111111';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    const sourceRatio = video.videoWidth / Math.max(1, video.videoHeight);
+    const targetRatio = canvas.width / canvas.height;
+    const width = sourceRatio >= targetRatio ? canvas.width : canvas.height * sourceRatio;
+    const height = sourceRatio >= targetRatio ? canvas.width / sourceRatio : canvas.height;
+    context.drawImage(video, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
     frames.push(canvas.toDataURL('image/jpeg', 0.68));
   }
   video.removeAttribute('src');
@@ -2200,6 +2218,9 @@ function EditorView(props: {
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const audioRefs = useRef(new Map<string, HTMLAudioElement>());
   const clipboardClipsRef = useRef<TimelineItem[]>([]);
+  const thumbnailJobRef = useRef<string | undefined>(undefined);
+  const thumbnailFailuresRef = useRef(new Set<string>());
+  const editorMountedRef = useRef(true);
   const appliedFocusRef = useRef<string | undefined>(undefined);
   const tracksRef = useRef<HTMLDivElement>(null);
   const timelineRulerRef = useRef<HTMLDivElement>(null);
@@ -2348,16 +2369,23 @@ function EditorView(props: {
     required.forEach((assetId) => { void props.onEnsureAssetLoaded(assetId, true).catch(() => undefined); });
   }, [playhead, selectedClip?.assetId, selectedAssetId, props.project.id]);
 
+  useEffect(() => () => { editorMountedRef.current = false; }, []);
+
   useEffect(() => {
-    let canceled = false;
-    const assets = props.project.assets.filter((asset) => asset.kind === 'video' && asset.objectUrl && props.project.timeline.some((clip) => clip.assetId === asset.id) && !videoThumbnails[asset.id]);
-    assets.forEach((asset) => {
-      void captureVideoThumbnails(asset.objectUrl!).then((frames) => {
-        if (!canceled && frames.length) setVideoThumbnails((current) => ({ ...current, [asset.id]: frames }));
-      }).catch(() => undefined);
+    if (thumbnailJobRef.current) return;
+    const asset = props.project.assets.find((item) => item.kind === 'video' && item.objectUrl && !videoThumbnails[item.id] && !thumbnailFailuresRef.current.has(item.id));
+    if (!asset) return;
+    thumbnailJobRef.current = asset.id;
+    void captureVideoThumbnails(asset.objectUrl!).then((frames) => {
+      if (!frames.length) thumbnailFailuresRef.current.add(asset.id);
+      if (editorMountedRef.current) setVideoThumbnails((current) => frames.length ? { ...current, [asset.id]: frames } : { ...current });
+    }).catch(() => {
+      thumbnailFailuresRef.current.add(asset.id);
+      if (editorMountedRef.current) setVideoThumbnails((current) => ({ ...current }));
+    }).finally(() => {
+      thumbnailJobRef.current = undefined;
     });
-    return () => { canceled = true; };
-  }, [props.project.assets, props.project.timeline, videoThumbnails]);
+  }, [props.project.assets, videoThumbnails]);
 
   useEffect(() => {
     const validIds = selectedClipIds.filter((id) => props.project.timeline.some((clip) => clip.id === id));
@@ -3109,7 +3137,8 @@ function EditorView(props: {
                 >
                   <span className={`asset-thumbnail ${asset.kind}`}>
                     {asset.objectUrl && asset.kind === 'image' ? <img src={asset.objectUrl} alt="" draggable={false} /> : null}
-                    {asset.objectUrl && asset.kind === 'video' ? <video src={asset.objectUrl} muted playsInline preload="metadata" draggable={false} onLoadedMetadata={(event) => { if (event.currentTarget.duration > 0) event.currentTarget.currentTime = Math.min(0.1, event.currentTarget.duration / 2); }} /> : null}
+                    {asset.kind === 'video' && videoThumbnails[asset.id]?.[0] ? <img src={videoThumbnails[asset.id][0]} alt="" draggable={false} /> : null}
+                    {asset.objectUrl && asset.kind === 'video' && !videoThumbnails[asset.id]?.[0] ? <video src={asset.objectUrl} muted playsInline preload="auto" draggable={false} onLoadedData={(event) => { const duration = event.currentTarget.duration; event.currentTarget.currentTime = Number.isFinite(duration) && duration > 0.1 ? Math.min(0.15, duration / 2) : 0; }} /> : null}
                     {asset.kind === 'audio' ? <Music size={28} /> : null}
                     {!asset.objectUrl && asset.kind !== 'audio' ? (asset.kind === 'video' ? <Video size={28} /> : <ImageIcon size={28} />) : null}
                     {asset.uploadState === 'uploading' ? <Loader2 className="asset-loading spin" size={20} /> : null}
@@ -3537,6 +3566,7 @@ function EditorView(props: {
                         <button className="clip-trim-handle start" aria-label="Ajustar inicio" onPointerDown={(event) => beginTrim(event, clip, 'start')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
                         {clip.transition?.type && clip.transition.type !== 'none' ? <span className={`clip-transition ${clip.transition.type}`} style={{ width: `${Math.min(100, (clip.transition.duration / Math.max(0.01, clip.duration)) * 100)}%` }} title={`${clip.transition.type} ${clip.transition.duration}s`} /> : null}
                         {asset?.kind === 'video' && videoThumbnails[asset.id]?.length ? <span className="clip-thumbnail-strip">{videoThumbnails[asset.id].map((frame, index) => <img key={`${asset.id}_${index}`} src={frame} alt="" draggable={false} />)}</span> : null}
+                        {asset?.kind === 'image' && asset.objectUrl ? <span className="clip-thumbnail-strip single"><img src={asset.objectUrl} alt="" draggable={false} /></span> : null}
                         <span className="clip-title">{clip.type === 'text' ? (clip.text || 'Texto') : (asset?.name || clip.type)}</span>
                         <button className="clip-trim-handle end" aria-label="Ajustar final" onPointerDown={(event) => beginTrim(event, clip, 'end')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
                       </div>
