@@ -149,11 +149,30 @@ function readAssetMetadata(kind: AssetRecord['kind'], objectUrl: string): Promis
       return;
     }
     const media = document.createElement(kind === 'video' ? 'video' : 'audio');
-    media.onloadedmetadata = () => resolve({
-      duration: Number.isFinite(media.duration) ? media.duration : undefined,
+    media.preload = 'metadata';
+    const dimensions = () => ({
       width: kind === 'video' ? (media as HTMLVideoElement).videoWidth : undefined,
       height: kind === 'video' ? (media as HTMLVideoElement).videoHeight : undefined
     });
+    const finalize = (duration: number) => resolve({
+      duration: Number.isFinite(duration) && duration > 0 ? duration : undefined,
+      ...dimensions()
+    });
+    media.onloadedmetadata = () => {
+      // Some containers (notably WebM from MediaRecorder) report Infinity/NaN until the
+      // element is seeked past the end, which forces the real duration to be computed.
+      if (Number.isFinite(media.duration) && media.duration > 0) {
+        finalize(media.duration);
+        return;
+      }
+      const onSeeked = () => {
+        media.removeEventListener('timeupdate', onSeeked);
+        media.currentTime = 0;
+        finalize(media.duration);
+      };
+      media.addEventListener('timeupdate', onSeeked);
+      media.currentTime = Number.MAX_SAFE_INTEGER;
+    };
     media.onerror = () => resolve({});
     media.src = objectUrl;
   });
@@ -253,6 +272,17 @@ function colorWithAlpha(color: string, alpha: number) {
 function timelineItemsOverlap(start: number, duration: number, other: TimelineItem): boolean {
   const epsilon = 0.001;
   return start < other.start + other.duration - epsilon && start + duration > other.start + epsilon;
+}
+
+// Maximum timeline duration a clip can occupy without running past the end of its
+// source media. Images/text have no media limit. The available source span after the
+// trim-in point is (asset.duration - trimStart), played back at playbackRate.
+function clipMediaLimit(clip: Pick<TimelineItem, 'type' | 'trimStart' | 'playbackRate'>, asset: AssetRecord | undefined): number {
+  if (!asset || (clip.type !== 'video' && clip.type !== 'audio')) return Number.POSITIVE_INFINITY;
+  if (!asset.duration || !Number.isFinite(asset.duration)) return Number.POSITIVE_INFINITY;
+  const rate = clip.playbackRate || 1;
+  const available = asset.duration - (clip.trimStart || 0);
+  return Math.max(0.2, available / rate);
 }
 
 function compactTimelineTracks(timeline: TimelineItem[], trackIds: Set<string>): TimelineItem[] {
@@ -912,8 +942,20 @@ export function App() {
     }
   }
 
-  function placeAssetOnTimeline(assetId: string, start: number, requestedTrackId?: string) {
+  async function placeAssetOnTimeline(assetId: string, start: number, requestedTrackId?: string) {
     const clipId = uid('clip');
+    // Make sure we know the real media length before placing, otherwise the clip would
+    // fall back to a placeholder duration and not appear at its full length.
+    const pending = activeProject?.assets.find((item) => item.id === assetId && !item.trashedAt);
+    if (pending && (pending.kind === 'video' || pending.kind === 'audio') && (!pending.duration || !Number.isFinite(pending.duration)) && pending.objectUrl) {
+      const metadata = await readAssetMetadata(pending.kind, pending.objectUrl);
+      if (metadata.duration || metadata.width || metadata.height) {
+        patchActiveProject((project) => ({
+          ...project,
+          assets: project.assets.map((entry) => entry.id === assetId ? { ...entry, ...metadata } : entry)
+        }), false);
+      }
+    }
     patchActiveProject((project) => {
       const asset = project.assets.find((item) => item.id === assetId && !item.trashedAt);
       if (!asset) return project;
@@ -1133,6 +1175,11 @@ export function App() {
           updated = { ...updated, start: safeStart, duration: Number.isFinite(safeDuration) ? safeDuration : updated.duration };
         }
         if (siblings.some((clip) => timelineItemsOverlap(updated.start, updated.duration, clip))) updated = current;
+      }
+      // Never let a video/audio clip extend past the end of its source media.
+      const mediaLimit = clipMediaLimit(updated, updated.assetId ? project.assets.find((asset) => asset.id === updated.assetId) : undefined);
+      if (Number.isFinite(mediaLimit) && updated.duration > mediaLimit) {
+        updated = { ...updated, duration: Math.max(0.2, mediaLimit) };
       }
       let timeline = project.timeline.map((clip) => clip.id === clipId ? updated : clip);
       if (ripple && (patch.start !== undefined || patch.duration !== undefined || patch.playbackRate !== undefined)) {
@@ -2348,6 +2395,7 @@ function EditorView(props: {
   const cancelProjectTitleEditRef = useRef(false);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const audioRefs = useRef(new Map<string, HTMLAudioElement>());
+  const preloadRefs = useRef(new Map<string, HTMLVideoElement>());
   const clipboardClipsRef = useRef<TimelineItem[]>([]);
   const thumbnailJobRef = useRef<string | undefined>(undefined);
   const thumbnailFailuresRef = useRef(new Set<string>());
@@ -2407,6 +2455,8 @@ function EditorView(props: {
     originStart: number;
     originDuration: number;
     originTrimStart: number;
+    mediaDuration?: number;
+    playbackRate: number;
   } | null>(null);
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const [timelineScrollbarWidth, setTimelineScrollbarWidth] = useState(0);
@@ -2419,6 +2469,15 @@ function EditorView(props: {
     .filter((clip) => clip.start <= playhead && playhead < clip.start + clip.duration && (clip.type === 'video' || clip.type === 'image') && !props.project.tracks.find((track) => track.id === clip.trackId)?.hidden)
     .sort((a, b) => props.project.tracks.findIndex((track) => track.id === b.trackId) - props.project.tracks.findIndex((track) => track.id === a.trackId));
   const activeAudioClips = props.project.timeline.filter((clip) => clip.type === 'audio' && clip.start <= playhead && playhead < clip.start + clip.duration && !props.project.tracks.find((track) => track.id === clip.trackId)?.hidden);
+  // Video clips that start just ahead of the playhead. We mount them hidden and pre-seek
+  // their first frame so the transition into them doesn't flash a black frame.
+  const upcomingVisualClips = props.project.timeline.filter((clip) =>
+    clip.type === 'video'
+    && clip.start > playhead
+    && clip.start - playhead <= 0.75
+    && !activeVisualClips.some((active) => active.id === clip.id)
+    && !props.project.tracks.find((track) => track.id === clip.trackId)?.hidden
+  );
   const activeAudioAsset = activeAudioClips[0]?.assetId ? props.project.assets.find((asset) => asset.id === activeAudioClips[0].assetId) : undefined;
   const timelineMediaEnd = props.project.timeline.length
     ? Math.max(...props.project.timeline.map((clip) => clip.start + clip.duration))
@@ -2619,6 +2678,20 @@ function EditorView(props: {
       else audio.pause();
     });
   }, [playhead, playing, activeVisualClips, activeAudioClips, props.project.tracks]);
+
+  // Decode the first frame of clips that are about to start so they appear instantly.
+  useEffect(() => {
+    upcomingVisualClips.forEach((clip) => {
+      const video = preloadRefs.current.get(clip.id);
+      if (!video) return;
+      const rate = clip.playbackRate || 1;
+      const firstFrame = Math.max(0, clip.reverse ? (clip.trimStart || 0) + clip.duration * rate - 1 / props.project.fps : clip.trimStart || 0);
+      if (Math.abs(video.currentTime - firstFrame) > 0.05) {
+        try { video.currentTime = firstFrame; } catch { /* not ready yet */ }
+      }
+      video.pause();
+    });
+  }, [upcomingVisualClips, props.project.fps]);
 
   const seekFromPointer = (event: ReactPointerEvent<HTMLElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -2859,6 +2932,9 @@ function EditorView(props: {
     event.currentTarget.setPointerCapture(event.pointerId);
     props.onBeginHistoryTransaction();
     setTrimSnapTime(undefined);
+    const asset = (clip.type === 'video' || clip.type === 'audio') && clip.assetId
+      ? props.project.assets.find((item) => item.id === clip.assetId)
+      : undefined;
     trimGestureRef.current = {
       pointerId: event.pointerId,
       clipId: clip.id,
@@ -2867,7 +2943,9 @@ function EditorView(props: {
       pixelsPerSecond: Math.max(0.001, timelinePixelsPerSecond),
       originStart: clip.start,
       originDuration: clip.duration,
-      originTrimStart: clip.trimStart || 0
+      originTrimStart: clip.trimStart || 0,
+      mediaDuration: asset?.duration && Number.isFinite(asset.duration) ? asset.duration : undefined,
+      playbackRate: clip.playbackRate || 1
     };
   };
 
@@ -2885,12 +2963,19 @@ function EditorView(props: {
       return candidate?.time ?? rawTime;
     };
     if (gesture.edge === 'end') {
-      const end = snapValue(gesture.originStart + gesture.originDuration + delta);
+      let end = snapValue(gesture.originStart + gesture.originDuration + delta);
+      if (gesture.mediaDuration) {
+        const maxEnd = gesture.originStart + (gesture.mediaDuration - gesture.originTrimStart) / gesture.playbackRate;
+        end = Math.min(end, maxEnd);
+      }
       props.onUpdateClip(gesture.clipId, { duration: Math.max(0.2, end - gesture.originStart) });
       return;
     }
     const start = snapValue(gesture.originStart + delta);
-    const appliedDelta = clamp(start - gesture.originStart, -gesture.originStart, gesture.originDuration - 0.2);
+    // For media clips the start edge can't move earlier than the source's trim-in point,
+    // otherwise we'd expose media that doesn't exist (a frozen/black lead-in frame).
+    const minDelta = gesture.mediaDuration ? Math.max(-gesture.originStart, -gesture.originTrimStart) : -gesture.originStart;
+    const appliedDelta = clamp(start - gesture.originStart, minDelta, gesture.originDuration - 0.2);
     props.onUpdateClip(gesture.clipId, {
       start: gesture.originStart + appliedDelta,
       duration: gesture.originDuration - appliedDelta,
@@ -3389,6 +3474,24 @@ function EditorView(props: {
                       />
                     ) : null}
                   </div>
+                );
+              })}
+              {upcomingVisualClips.map((clip) => {
+                const asset = clip.assetId ? props.project.assets.find((item) => item.id === clip.assetId) : undefined;
+                if (!asset?.objectUrl) return null;
+                return (
+                  <video
+                    key={`preload-${clip.id}`}
+                    ref={(node) => { if (node) preloadRefs.current.set(clip.id, node); else preloadRefs.current.delete(clip.id); }}
+                    src={asset.objectUrl}
+                    muted
+                    playsInline
+                    controls={false}
+                    draggable={false}
+                    preload="auto"
+                    aria-hidden="true"
+                    style={{ position: 'absolute', width: 2, height: 2, opacity: 0, pointerEvents: 'none', left: 0, top: 0 }}
+                  />
                 );
               })}
               {!activeVisualClips.length && activeAudioAsset?.objectUrl ? (
