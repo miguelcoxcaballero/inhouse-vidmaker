@@ -1813,6 +1813,7 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
   const [cameraId, setCameraId] = useState('');
   const [microphoneId, setMicrophoneId] = useState('');
   const [audioEnabled, setAudioEnabled] = useState(true);
+  const [mirror, setMirror] = useState(false);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [connectionState, setConnectionState] = useState<'connecting' | 'ready' | 'error'>('connecting');
   const [error, setError] = useState('');
@@ -1823,11 +1824,20 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const mirrorFrameRef = useRef<number | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const recordingStartedAtRef = useRef(0);
   const discardRecordingRef = useRef(false);
   const cameras = devices.filter((device) => device.kind === 'videoinput');
   const microphones = devices.filter((device) => device.kind === 'audioinput');
+
+  const stopMirroredRecordingStream = () => {
+    if (mirrorFrameRef.current !== null) cancelAnimationFrame(mirrorFrameRef.current);
+    mirrorFrameRef.current = null;
+    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+    recordingStreamRef.current = null;
+  };
 
   useEffect(() => {
     let disposed = false;
@@ -1899,6 +1909,8 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
     return () => navigator.mediaDevices.removeEventListener('devicechange', refreshDevices);
   }, []);
 
+  useEffect(() => () => stopMirroredRecordingStream(), []);
+
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && !recording) props.onClose();
@@ -1920,7 +1932,16 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     const context = canvas.getContext('2d');
-    context?.drawImage(video, 0, 0, canvas.width, canvas.height);
+    if (!context) {
+      setSaving(false);
+      setError('No se pudo preparar la foto.');
+      return;
+    }
+    if (mirror) {
+      context.translate(canvas.width, 0);
+      context.scale(-1, 1);
+    }
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
     const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.94));
     if (!blob) {
       setSaving(false);
@@ -1932,6 +1953,7 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
 
   const startRecording = () => {
     const stream = streamRef.current;
+    const video = videoRef.current;
     if (!stream || typeof MediaRecorder === 'undefined') {
       setError('La grabacion de video no esta disponible en este navegador.');
       return;
@@ -1939,16 +1961,41 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
     const preferredTypes = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
     const mimeType = preferredTypes.find((type) => MediaRecorder.isTypeSupported(type)) || '';
     try {
+      let recorderStream = stream;
+      if (mirror) {
+        if (!video || video.videoWidth < 1 || video.videoHeight < 1) {
+          setError('La camara aun no esta lista para grabar.');
+          return;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('No se pudo preparar el video reflejado.');
+        const drawFrame = () => {
+          context.setTransform(-1, 0, 0, 1, canvas.width, 0);
+          context.drawImage(video, 0, 0, canvas.width, canvas.height);
+          mirrorFrameRef.current = requestAnimationFrame(drawFrame);
+        };
+        drawFrame();
+        const frameRate = Math.max(1, Math.min(60, stream.getVideoTracks()[0]?.getSettings().frameRate || 30));
+        const mirroredStream = canvas.captureStream(frameRate);
+        stream.getAudioTracks().forEach((track) => mirroredStream.addTrack(track.clone()));
+        recordingStreamRef.current = mirroredStream;
+        recorderStream = mirroredStream;
+      }
       chunksRef.current = [];
       discardRecordingRef.current = false;
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      const recorder = new MediaRecorder(recorderStream, mimeType ? { mimeType } : undefined);
       recorderRef.current = recorder;
       recorder.ondataavailable = (event) => { if (event.data.size) chunksRef.current.push(event.data); };
       recorder.onerror = () => {
+        stopMirroredRecordingStream();
         setRecording(false);
         setError('La grabacion se ha interrumpido.');
       };
       recorder.onstop = () => {
+        stopMirroredRecordingStream();
         setRecording(false);
         if (discardRecordingRef.current) return;
         const type = recorder.mimeType || mimeType || 'video/webm';
@@ -1966,6 +2013,7 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
       setRecording(true);
       recorder.start(250);
     } catch {
+      stopMirroredRecordingStream();
       setError('No se pudo comenzar la grabacion.');
     }
   };
@@ -1994,7 +2042,7 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
         </div>
         <div className="capture-body">
           <div className="capture-preview">
-            <video ref={videoRef} muted playsInline autoPlay />
+            <video ref={videoRef} className={mirror ? 'mirrored' : ''} muted playsInline autoPlay />
             {connectionState === 'connecting' ? <div className="capture-state"><Loader2 className="spin" size={28} /><span>Iniciando camara...</span></div> : null}
             {connectionState === 'error' ? <div className="capture-state error"><Camera size={30} /><span>{error}</span><button className="btn btn-secondary" onClick={() => setRetryVersion((value) => value + 1)}><RefreshCw size={15} /> Reintentar</button></div> : null}
             {recording ? <div className="capture-recording"><span /> REC {Math.floor(elapsed / 60).toString().padStart(2, '0')}:{Math.floor(elapsed % 60).toString().padStart(2, '0')}</div> : null}
@@ -2015,6 +2063,7 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
               {audioEnabled && mode === 'video' ? <Mic size={17} /> : <MicOff size={17} />}
               Grabar audio
             </label>
+            <button className={`capture-mirror-toggle ${mirror ? 'active' : ''}`} disabled={recording} onClick={() => setMirror((value) => !value)}><FlipHorizontal2 size={17} /> Reflejar imagen</button>
             {error && connectionState !== 'error' ? <div className="capture-inline-error">{error}</div> : null}
           </div>
         </div>

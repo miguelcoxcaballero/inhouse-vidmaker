@@ -2577,6 +2577,10 @@ button {
   background: #080808;
 }
 
+.capture-preview video.mirrored {
+  transform: scaleX(-1);
+}
+
 .capture-state {
   position: absolute;
   inset: 0;
@@ -2689,6 +2693,30 @@ button {
   width: 15px;
   height: 15px;
   accent-color: var(--accent-orange);
+}
+
+.capture-mirror-toggle {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-align: left;
+}
+
+.capture-mirror-toggle.active {
+  border-color: rgba(224, 122, 60, 0.45);
+  color: var(--accent-orange);
+  background: rgba(224, 122, 60, 0.08);
+}
+
+.capture-mirror-toggle:disabled {
+  opacity: 0.55;
 }
 
 .capture-inline-error {
