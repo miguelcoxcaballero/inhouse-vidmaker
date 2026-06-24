@@ -210,7 +210,7 @@ async function captureImageThumbnail(objectUrl: string): Promise<string> {
   return canvas.toDataURL('image/jpeg', 0.72);
 }
 
-async function captureVideoThumbnails(objectUrl: string, count = 5): Promise<string[]> {
+async function captureVideoThumbnails(objectUrl: string, count = 5, onFrame?: (index: number, dataUrl: string) => void): Promise<string[]> {
   const video = document.createElement('video');
   video.src = objectUrl;
   video.muted = true;
@@ -230,6 +230,8 @@ async function captureVideoThumbnails(objectUrl: string, count = 5): Promise<str
   const seekableEnd = video.seekable.length ? video.seekable.end(video.seekable.length - 1) : 0;
   const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : seekableEnd;
   const frames: string[] = [];
+  // Capture the poster frame (index 0) first and hand it back immediately so the UI can
+  // show a preview without waiting for the whole strip to finish seeking.
   for (let index = 0; index < count; index += 1) {
     const time = duration > 0 ? Math.min(duration - 0.01, (duration * (index + 0.5)) / count) : 0;
     await new Promise<void>((resolve) => {
@@ -241,7 +243,7 @@ async function captureVideoThumbnails(objectUrl: string, count = 5): Promise<str
         video.onseeked = null;
         resolve();
       };
-      const timeout = window.setTimeout(finish, 1200);
+      const timeout = window.setTimeout(finish, 600);
       video.onseeked = finish;
       video.currentTime = Math.max(0, time);
       if (video.readyState >= 2 && Math.abs(video.currentTime - time) < 0.02) finish();
@@ -253,7 +255,9 @@ async function captureVideoThumbnails(objectUrl: string, count = 5): Promise<str
     const width = sourceRatio >= targetRatio ? canvas.width : canvas.height * sourceRatio;
     const height = sourceRatio >= targetRatio ? canvas.width / sourceRatio : canvas.height;
     context.drawImage(video, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
-    frames.push(canvas.toDataURL('image/jpeg', 0.68));
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.68);
+    frames.push(dataUrl);
+    onFrame?.(index, dataUrl);
   }
   video.removeAttribute('src');
   video.load();
@@ -277,6 +281,27 @@ function timelineItemsOverlap(start: number, duration: number, other: TimelineIt
 // Maximum timeline duration a clip can occupy without running past the end of its
 // source media. Images/text have no media limit. The available source span after the
 // trim-in point is (asset.duration - trimStart), played back at playbackRate.
+// The asset shown at the very start of the project — i.e. its first frame. We pick the
+// visual clip that is on screen at time 0 (preferring the top-most track), falling back
+// to the earliest-starting clip if nothing sits exactly on the start.
+function projectFirstFrameAsset(project: ProjectRecord): AssetRecord | undefined {
+  const trackOrder = (clip: TimelineItem) => {
+    const index = project.tracks.findIndex((track) => track.id === clip.trackId);
+    return index < 0 ? Number.MAX_SAFE_INTEGER : index;
+  };
+  const visualClips = project.timeline.filter((clip) =>
+    (clip.type === 'video' || clip.type === 'image')
+    && !project.tracks.find((track) => track.id === clip.trackId)?.hidden
+  );
+  if (!visualClips.length) return undefined;
+  const atStart = visualClips
+    .filter((clip) => clip.start <= 0.001)
+    .sort((a, b) => trackOrder(a) - trackOrder(b));
+  const chosen = atStart[0]
+    ?? visualClips.slice().sort((a, b) => a.start - b.start || trackOrder(a) - trackOrder(b))[0];
+  return chosen?.assetId ? project.assets.find((asset) => asset.id === chosen.assetId && !asset.trashedAt) : undefined;
+}
+
 function clipMediaLimit(clip: Pick<TimelineItem, 'type' | 'trimStart' | 'playbackRate'>, asset: AssetRecord | undefined): number {
   if (!asset || (clip.type !== 'video' && clip.type !== 'audio')) return Number.POSITIVE_INFINITY;
   if (!asset.duration || !Number.isFinite(asset.duration)) return Number.POSITIVE_INFINITY;
@@ -365,10 +390,11 @@ export function App() {
   useEffect(() => {
     if (activeProjectId || !profile || homeThumbnailJobRef.current) return;
     const target = projects.map((project) => {
-      const visualAssets = project.assets.filter((asset) => !asset.trashedAt && (asset.kind === 'video' || asset.kind === 'image'));
-      if (visualAssets.some((asset) => asset.thumbnailDataUrl)) return undefined;
-      const asset = visualAssets.find((item) => item.driveFileId && !homeThumbnailFailuresRef.current.has(`${project.id}:${item.id}`));
-      return asset ? { project, asset } : undefined;
+      // Prefer the project's first frame so the card matches what the project opens on.
+      const asset = projectFirstFrameAsset(project);
+      if (!asset || asset.thumbnailDataUrl || !asset.driveFileId) return undefined;
+      if (homeThumbnailFailuresRef.current.has(`${project.id}:${asset.id}`)) return undefined;
+      return { project, asset };
     }).find((entry): entry is { project: ProjectRecord; asset: AssetRecord } => !!entry);
     if (!target) return;
     const jobKey = `${target.project.id}:${target.asset.id}`;
@@ -1704,15 +1730,17 @@ function ProjectCard(props: {
   onDelete(): void;
 }) {
   const [open, setOpen] = useState(false);
-  const visualAssets = props.project.assets.filter((asset) => !asset.trashedAt && (asset.kind === 'video' || asset.kind === 'image'));
-  const firstAsset = visualAssets.find((asset) => asset.thumbnailDataUrl) || visualAssets[0];
-  const previewSource = firstAsset?.thumbnailDataUrl || (firstAsset?.kind === 'image' ? firstAsset.objectUrl : undefined);
+  const firstFrameAsset = projectFirstFrameAsset(props.project);
+  const previewSource = firstFrameAsset?.thumbnailDataUrl || (firstFrameAsset?.kind === 'image' ? firstFrameAsset.objectUrl : undefined);
+  const previewPending = !previewSource && !!firstFrameAsset;
   return (
     <article className={`drive-card ${props.compact ? 'compact' : ''}`} onDoubleClick={props.onOpen}>
       <button className="drive-card-open" onClick={props.onOpen} aria-label={`Abrir ${props.project.name}`}>
         <div className="drive-card-preview">
           {previewSource ? (
             <img src={previewSource} alt="" />
+          ) : previewPending ? (
+            <span className="thumb-skeleton" />
           ) : (
             <div className="video-preview-mark">
               <Video size={34} />
@@ -2420,7 +2448,7 @@ function EditorView(props: {
   const clipboardClipsRef = useRef<TimelineItem[]>([]);
   const thumbnailJobRef = useRef<string | undefined>(undefined);
   const thumbnailFailuresRef = useRef(new Set<string>());
-  const remoteThumbnailJobRef = useRef<string | undefined>(undefined);
+  const remoteThumbnailJobsRef = useRef(new Set<string>());
   const remoteThumbnailFailuresRef = useRef(new Set<string>());
   const imageThumbnailJobRef = useRef<string | undefined>(undefined);
   const imageThumbnailFailuresRef = useRef(new Set<string>());
@@ -2591,7 +2619,15 @@ function EditorView(props: {
     const asset = props.project.assets.find((item) => item.kind === 'video' && item.objectUrl && !videoThumbnails[item.id] && !thumbnailFailuresRef.current.has(item.id));
     if (!asset) return;
     thumbnailJobRef.current = asset.id;
-    void captureVideoThumbnails(asset.objectUrl!).then((frames) => {
+    let postered = false;
+    void captureVideoThumbnails(asset.objectUrl!, 5, (index, dataUrl) => {
+      // Show the poster frame the moment it's ready instead of waiting for the full strip.
+      if (index === 0 && !postered) {
+        postered = true;
+        if (!asset.thumbnailDataUrl) props.onSetAssetThumbnail(asset.id, dataUrl);
+        if (editorMountedRef.current) setVideoThumbnails((current) => ({ ...current, [asset.id]: [dataUrl] }));
+      }
+    }).then((frames) => {
       if (!frames.length) thumbnailFailuresRef.current.add(asset.id);
       if (frames[0] && !asset.thumbnailDataUrl) props.onSetAssetThumbnail(asset.id, frames[0]);
       if (editorMountedRef.current) setVideoThumbnails((current) => frames.length ? { ...current, [asset.id]: frames } : { ...current });
@@ -2621,17 +2657,25 @@ function EditorView(props: {
   }, [props.onSetAssetThumbnail, props.project.assets]);
 
   useEffect(() => {
-    if (remoteThumbnailJobRef.current) return;
-    const asset = props.project.assets.find((item) =>
-      (item.kind === 'video' || item.kind === 'image') && item.driveFileId && !item.thumbnailDataUrl && !remoteThumbnailFailuresRef.current.has(item.id)
+    const maxConcurrent = 3;
+    const pending = props.project.assets.filter((item) =>
+      (item.kind === 'video' || item.kind === 'image')
+      && item.driveFileId
+      && !item.thumbnailDataUrl
+      && !item.trashedAt
+      && !remoteThumbnailFailuresRef.current.has(item.id)
+      && !remoteThumbnailJobsRef.current.has(item.id)
     );
-    if (!asset) return;
-    remoteThumbnailJobRef.current = asset.id;
-    void props.onEnsureAssetThumbnail(asset.id).then((available) => {
-      if (!available) remoteThumbnailFailuresRef.current.add(asset.id);
-    }).finally(() => {
-      remoteThumbnailJobRef.current = undefined;
-      if (editorMountedRef.current) setThumbnailQueueVersion((version) => version + 1);
+    const slots = maxConcurrent - remoteThumbnailJobsRef.current.size;
+    if (slots <= 0) return;
+    pending.slice(0, slots).forEach((asset) => {
+      remoteThumbnailJobsRef.current.add(asset.id);
+      void props.onEnsureAssetThumbnail(asset.id).then((available) => {
+        if (!available) remoteThumbnailFailuresRef.current.add(asset.id);
+      }).finally(() => {
+        remoteThumbnailJobsRef.current.delete(asset.id);
+        if (editorMountedRef.current) setThumbnailQueueVersion((version) => version + 1);
+      });
     });
   }, [props.onEnsureAssetThumbnail, props.project.assets, thumbnailQueueVersion]);
 
@@ -3414,8 +3458,10 @@ function EditorView(props: {
                     {asset.kind === 'video' && (videoThumbnails[asset.id]?.[0] || asset.thumbnailDataUrl) ? <img src={videoThumbnails[asset.id]?.[0] || asset.thumbnailDataUrl} alt="" draggable={false} /> : null}
                     {asset.objectUrl && asset.kind === 'video' && !videoThumbnails[asset.id]?.[0] && !asset.thumbnailDataUrl ? <video src={asset.objectUrl} muted playsInline preload="auto" draggable={false} onLoadedData={(event) => { const duration = event.currentTarget.duration; event.currentTarget.currentTime = Number.isFinite(duration) && duration > 0.1 ? Math.min(0.15, duration / 2) : 0; }} /> : null}
                     {asset.kind === 'audio' ? <Music size={28} /> : null}
-                    {!asset.objectUrl && !asset.thumbnailDataUrl && asset.kind !== 'audio' ? (asset.kind === 'video' ? <Video size={28} /> : <ImageIcon size={28} />) : null}
-                    {asset.uploadState === 'uploading' ? <Loader2 className="asset-loading spin" size={20} /> : null}
+                    {!asset.objectUrl && !asset.thumbnailDataUrl && asset.kind !== 'audio' ? (
+                      asset.driveFileId ? <span className="thumb-skeleton" /> : (asset.kind === 'video' ? <Video size={28} /> : <ImageIcon size={28} />)
+                    ) : null}
+                    {asset.uploadState === 'uploading' ? <span className="preview-spinner asset-loading" aria-label="Cargando" /> : null}
                   </span>
                   <span className="asset-copy"><strong>{asset.name}</strong><span>{formatBytes(asset.size)} - {asset.uploadState === 'error' ? 'error' : asset.uploadState === 'uploading' ? 'cargando' : 'listo'}</span></span>
                 </button>

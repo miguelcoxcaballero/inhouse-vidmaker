@@ -84,6 +84,40 @@ button {
   }
 }
 
+/* Clean ring spinner for loading previews. */
+.preview-spinner {
+  display: inline-block;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: conic-gradient(from 90deg, rgba(255, 255, 255, 0) 0deg, var(--accent-orange) 300deg, var(--accent-orange) 360deg);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2.5px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2.5px));
+  animation: spin 0.7s cubic-bezier(0.5, 0.15, 0.5, 0.85) infinite;
+}
+
+/* Shimmer placeholder shown while a preview thumbnail is still being prepared. */
+.thumb-skeleton {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background:
+    linear-gradient(100deg, rgba(255, 255, 255, 0) 38%, rgba(255, 255, 255, 0.07) 50%, rgba(255, 255, 255, 0) 62%),
+    #161616;
+  background-size: 220% 100%, 100% 100%;
+  background-repeat: no-repeat;
+  animation: thumbShimmer 1.5s ease-in-out infinite;
+}
+
+@keyframes thumbShimmer {
+  from {
+    background-position: 140% 0, 0 0;
+  }
+  to {
+    background-position: -140% 0, 0 0;
+  }
+}
+
 .btn {
   display: inline-flex;
   align-items: center;
@@ -710,6 +744,7 @@ button {
 }
 
 .drive-card-preview {
+  position: relative;
   width: 100%;
   aspect-ratio: 4 / 3;
   border-radius: 10px;
