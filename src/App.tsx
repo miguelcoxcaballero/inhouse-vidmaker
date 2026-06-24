@@ -724,20 +724,41 @@ export function App() {
   async function ensureAssetThumbnail(assetId: string): Promise<boolean> {
     const project = activeProjectRef.current;
     const asset = project?.assets.find((item) => item.id === assetId);
-    if (!project || !asset) return false;
+    if (!project || !asset || asset.kind === 'audio') return false;
     if (asset.thumbnailDataUrl) return true;
-    if (!asset.driveFileId) return false;
     const pending = assetThumbnailPromisesRef.current.get(assetId);
     if (pending) return pending;
+    // Generate a thumbnail straight from a loaded copy of the media. Used both for the
+    // initial fast path (when the asset is already in memory) and as a reliable fallback
+    // when Drive has not produced its own thumbnail yet.
+    const generateLocal = async (objectUrl: string): Promise<boolean> => {
+      if (asset.kind === 'image') {
+        const dataUrl = await captureImageThumbnail(objectUrl).catch(() => '');
+        if (dataUrl) { setAssetThumbnail(assetId, dataUrl); return true; }
+        return false;
+      }
+      const frames = await captureVideoThumbnails(objectUrl).catch(() => [] as string[]);
+      if (frames[0]) { setAssetThumbnail(assetId, frames[0]); return true; }
+      return false;
+    };
     const promise = (async () => {
       try {
-        const blob = await drive.downloadThumbnail(asset.driveFileId!);
-        if (!blob) return false;
-        const thumbnailDataUrl = await blobToDataUrl(blob);
-        if (!thumbnailDataUrl) return false;
-        setAssetThumbnail(assetId, thumbnailDataUrl);
-        return true;
-      } catch {
+        if (asset.objectUrl && await generateLocal(asset.objectUrl)) return true;
+        if (asset.driveFileId) {
+          const blob = await drive.downloadThumbnail(asset.driveFileId).catch(() => undefined);
+          if (blob) {
+            const thumbnailDataUrl = await blobToDataUrl(blob).catch(() => '');
+            if (thumbnailDataUrl) { setAssetThumbnail(assetId, thumbnailDataUrl); return true; }
+          }
+          // Last resort: download the actual file and build the thumbnail ourselves.
+          try {
+            await ensureAssetLoaded(assetId, true);
+            const loaded = activeProjectRef.current?.assets.find((item) => item.id === assetId);
+            if (loaded?.objectUrl && await generateLocal(loaded.objectUrl)) return true;
+          } catch {
+            /* ignore — handled below */
+          }
+        }
         return false;
       } finally {
         assetThumbnailPromisesRef.current.delete(assetId);
@@ -2401,6 +2422,8 @@ function EditorView(props: {
   const thumbnailFailuresRef = useRef(new Set<string>());
   const remoteThumbnailJobRef = useRef<string | undefined>(undefined);
   const remoteThumbnailFailuresRef = useRef(new Set<string>());
+  const imageThumbnailJobRef = useRef<string | undefined>(undefined);
+  const imageThumbnailFailuresRef = useRef(new Set<string>());
   const editorMountedRef = useRef(true);
   const appliedFocusRef = useRef<string | undefined>(undefined);
   const tracksRef = useRef<HTMLDivElement>(null);
@@ -2579,6 +2602,23 @@ function EditorView(props: {
       thumbnailJobRef.current = undefined;
     });
   }, [props.project.assets, videoThumbnails]);
+
+  // Generate (and persist) thumbnails for images that have a loaded copy but no
+  // thumbnail yet — covers freshly added images and ones reopened from Drive.
+  useEffect(() => {
+    if (imageThumbnailJobRef.current) return;
+    const asset = props.project.assets.find((item) => item.kind === 'image' && item.objectUrl && !item.thumbnailDataUrl && !item.trashedAt && !imageThumbnailFailuresRef.current.has(item.id));
+    if (!asset) return;
+    imageThumbnailJobRef.current = asset.id;
+    void captureImageThumbnail(asset.objectUrl!).then((thumbnailDataUrl) => {
+      if (thumbnailDataUrl) props.onSetAssetThumbnail(asset.id, thumbnailDataUrl);
+      else imageThumbnailFailuresRef.current.add(asset.id);
+    }).catch(() => {
+      imageThumbnailFailuresRef.current.add(asset.id);
+    }).finally(() => {
+      imageThumbnailJobRef.current = undefined;
+    });
+  }, [props.onSetAssetThumbnail, props.project.assets]);
 
   useEffect(() => {
     if (remoteThumbnailJobRef.current) return;
