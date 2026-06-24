@@ -227,6 +227,43 @@ async function captureImageThumbnail(objectUrl: string): Promise<string> {
   return canvas.toDataURL('image/jpeg', 0.72);
 }
 
+async function captureVideoPoster(blob: Blob): Promise<string> {
+  const { ALL_FORMATS, BlobSource, Input, VideoSampleSink } = await import('mediabunny');
+  const input = new Input({ source: new BlobSource(blob), formats: ALL_FORMATS });
+  try {
+    const track = await input.getPrimaryVideoTrack();
+    if (!track || !(await track.canDecode())) return '';
+    const sink = new VideoSampleSink(track);
+    let sample = await sink.getSample(0);
+    if (!sample) {
+      for await (const firstSample of sink.samples()) {
+        sample = firstSample;
+        break;
+      }
+    }
+    if (!sample) return '';
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 160;
+      canvas.height = 90;
+      const context = canvas.getContext('2d');
+      if (!context) return '';
+      context.fillStyle = '#111111';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      const sourceRatio = sample.displayWidth / Math.max(1, sample.displayHeight);
+      const targetRatio = canvas.width / canvas.height;
+      const width = sourceRatio >= targetRatio ? canvas.width : canvas.height * sourceRatio;
+      const height = sourceRatio >= targetRatio ? canvas.width / sourceRatio : canvas.height;
+      sample.draw(context, 0, 0, sample.displayWidth, sample.displayHeight, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
+      return canvas.toDataURL('image/jpeg', 0.7);
+    } finally {
+      sample.close();
+    }
+  } finally {
+    input.dispose();
+  }
+}
+
 async function captureVideoThumbnails(objectUrl: string, count = 5, onFrame?: (index: number, dataUrl: string) => void): Promise<string[]> {
   const video = document.createElement('video');
   video.muted = true;
@@ -316,7 +353,7 @@ async function captureVideoThumbnails(objectUrl: string, count = 5, onFrame?: (i
 async function resolveAssetThumbnail(drive: DriveClient, asset: AssetRecord): Promise<string | undefined> {
   if (asset.kind === 'audio' || !asset.driveFileId) return undefined;
   try {
-    const blob = await drive.downloadThumbnail(asset.driveFileId);
+    const blob = await drive.downloadThumbnail(asset.driveFileId, asset.thumbnailLink);
     if (blob) {
       const dataUrl = await blobToDataUrl(blob);
       if (dataUrl) return dataUrl;
@@ -951,6 +988,9 @@ export function App() {
           blob = await drive.downloadFile(asset.driveFileId!);
           assetBlobCacheRef.current.set(asset.driveFileId!, blob);
         }
+        const poster = asset.kind === 'video' && !asset.thumbnailDataUrl
+          ? captureVideoPoster(blob).catch(() => '')
+          : undefined;
         const objectUrl = URL.createObjectURL(blob);
         const metadata = asset.kind === 'image' || asset.metadataVersion !== 2
           ? await readAssetMetadata(asset.kind, objectUrl)
@@ -965,6 +1005,7 @@ export function App() {
             duration: durationAfterTimelineCorrection(current, timeline)
           };
         }, false);
+        if (poster) void poster.then((thumbnailDataUrl) => setAssetThumbnail(assetId, thumbnailDataUrl));
       } catch (error) {
         patchActiveProject((current) => ({
           ...current,
@@ -1008,15 +1049,15 @@ export function App() {
         if (dataUrl) { setAssetThumbnail(assetId, dataUrl); return true; }
         return false;
       }
-      const frames = await captureVideoThumbnails(objectUrl).catch(() => [] as string[]);
-      if (frames[0]) { setAssetThumbnail(assetId, frames[0]); return true; }
+      const poster = await fetch(objectUrl).then((response) => response.blob()).then(captureVideoPoster).catch(() => '');
+      if (poster) { setAssetThumbnail(assetId, poster); return true; }
       return false;
     };
     const promise = (async () => {
       try {
         if (asset.objectUrl && await generateLocal(asset.objectUrl)) return true;
         if (asset.driveFileId) {
-          const blob = await drive.downloadThumbnail(asset.driveFileId).catch(() => undefined);
+          const blob = await drive.downloadThumbnail(asset.driveFileId, asset.thumbnailLink).catch(() => undefined);
           if (blob) {
             const thumbnailDataUrl = await blobToDataUrl(blob).catch(() => '');
             if (thumbnailDataUrl) { setAssetThumbnail(assetId, thumbnailDataUrl); return true; }
@@ -1062,7 +1103,7 @@ export function App() {
       const uploaded = await drive.uploadFile(file, asset.folderId || project.assetsFolderId);
       patchActiveProject((current) => ({
         ...current,
-        assets: current.assets.map((item) => item.id === assetId ? { ...item, driveFileId: uploaded.id, uploadState: 'uploaded' } : item)
+        assets: current.assets.map((item) => item.id === assetId ? { ...item, driveFileId: uploaded.id, thumbnailLink: uploaded.thumbnailLink, uploadState: 'uploaded' } : item)
       }), false);
       setToast(`${asset.name} se ha subido correctamente.`);
     } catch (error) {
@@ -1208,6 +1249,8 @@ export function App() {
       });
       if (kind === 'image') {
         void captureImageThumbnail(objectUrl).then((thumbnailDataUrl) => setAssetThumbnail(asset.id, thumbnailDataUrl)).catch(() => undefined);
+      } else if (kind === 'video') {
+        void captureVideoPoster(file).then((thumbnailDataUrl) => setAssetThumbnail(asset.id, thumbnailDataUrl)).catch(() => undefined);
       }
       const uploadFolderId = destinationFolderId || activeProject.assetsFolderId;
       if (drive.accessToken && uploadFolderId) {
@@ -1219,6 +1262,7 @@ export function App() {
             assets: project.assets.map((entry) => entry.id === asset.id ? {
               ...entry,
               driveFileId: uploaded.id,
+              thumbnailLink: uploaded.thumbnailLink,
               uploadState: 'uploaded'
             } : entry)
           }), false);
@@ -2726,6 +2770,7 @@ function EditorView(props: {
   const thumbnailFailuresRef = useRef(new Set<string>());
   const remoteThumbnailJobsRef = useRef(new Set<string>());
   const remoteThumbnailFailuresRef = useRef(new Set<string>());
+  const remoteThumbnailAttemptsRef = useRef(new Map<string, number>());
   const imageThumbnailJobRef = useRef<string | undefined>(undefined);
   const imageThumbnailFailuresRef = useRef(new Set<string>());
   const editorMountedRef = useRef(true);
@@ -2911,7 +2956,11 @@ function EditorView(props: {
 
   useEffect(() => {
     if (thumbnailJobRef.current) return;
-    const asset = props.project.assets.find((item) => item.kind === 'video' && item.objectUrl && !videoThumbnails[item.id] && !thumbnailFailuresRef.current.has(item.id));
+    const asset = props.project.assets.find((item) => item.kind === 'video'
+      && item.objectUrl
+      && props.project.timeline.some((clip) => clip.assetId === item.id)
+      && !videoThumbnails[item.id]
+      && !thumbnailFailuresRef.current.has(item.id));
     if (!asset) return;
     thumbnailJobRef.current = asset.id;
     let postered = false;
@@ -2933,7 +2982,7 @@ function EditorView(props: {
       // Advance the queue (a successful run already re-runs via videoFrames changing).
       if (editorMountedRef.current) setThumbnailQueueVersion((version) => version + 1);
     });
-  }, [props.project.assets, videoThumbnails, thumbnailQueueVersion]);
+  }, [props.project.assets, props.project.timeline, videoThumbnails, thumbnailQueueVersion]);
 
   // Generate (and persist) thumbnails for images that have a loaded copy but no
   // thumbnail yet — covers freshly added images and ones reopened from Drive.
@@ -2953,7 +3002,7 @@ function EditorView(props: {
   }, [props.onSetAssetThumbnail, props.project.assets]);
 
   useEffect(() => {
-    const maxConcurrent = 3;
+    const maxConcurrent = 6;
     const pending = props.project.assets.filter((item) =>
       (item.kind === 'video' || item.kind === 'image')
       && item.driveFileId
@@ -2967,7 +3016,20 @@ function EditorView(props: {
     pending.slice(0, slots).forEach((asset) => {
       remoteThumbnailJobsRef.current.add(asset.id);
       void props.onEnsureAssetThumbnail(asset.id).then((available) => {
-        if (!available) remoteThumbnailFailuresRef.current.add(asset.id);
+        if (available) {
+          remoteThumbnailFailuresRef.current.delete(asset.id);
+          remoteThumbnailAttemptsRef.current.delete(asset.id);
+          return;
+        }
+        const attempts = (remoteThumbnailAttemptsRef.current.get(asset.id) || 0) + 1;
+        remoteThumbnailAttemptsRef.current.set(asset.id, attempts);
+        remoteThumbnailFailuresRef.current.add(asset.id);
+        if (attempts < 3) {
+          window.setTimeout(() => {
+            remoteThumbnailFailuresRef.current.delete(asset.id);
+            if (editorMountedRef.current) setThumbnailQueueVersion((version) => version + 1);
+          }, attempts * 2000);
+        }
       }).finally(() => {
         remoteThumbnailJobsRef.current.delete(asset.id);
         if (editorMountedRef.current) setThumbnailQueueVersion((version) => version + 1);
@@ -3754,9 +3816,10 @@ function EditorView(props: {
               const hasPreview =
                 asset.kind === 'audio'
                 || (asset.kind === 'image' && !!(asset.thumbnailDataUrl || asset.objectUrl))
-                || (asset.kind === 'video' && !!(videoThumbnails[asset.id]?.[0] || asset.thumbnailDataUrl || asset.objectUrl));
+                || (asset.kind === 'video' && !!(videoThumbnails[asset.id]?.[0] || asset.thumbnailDataUrl));
               // The preview is still being prepared and we can actually produce one.
-              const previewLoading = !hasPreview && (!!asset.driveFileId || asset.uploadState === 'uploading');
+              const previewLoading = !hasPreview
+                && (asset.uploadState === 'uploading' || (!!asset.driveFileId && !remoteThumbnailFailuresRef.current.has(asset.id)));
               return (
               <div className={`asset-row ${selectedAssetId === asset.id ? 'selected' : ''}`} key={asset.id}>
                 <button
@@ -3777,7 +3840,6 @@ function EditorView(props: {
                   <span className={`asset-thumbnail ${asset.kind}`}>
                     {asset.kind === 'image' && (asset.thumbnailDataUrl || asset.objectUrl) ? <img src={asset.thumbnailDataUrl || asset.objectUrl} alt="" draggable={false} /> : null}
                     {asset.kind === 'video' && (videoThumbnails[asset.id]?.[0] || asset.thumbnailDataUrl) ? <img src={videoThumbnails[asset.id]?.[0] || asset.thumbnailDataUrl} alt="" draggable={false} /> : null}
-                    {asset.objectUrl && asset.kind === 'video' && !videoThumbnails[asset.id]?.[0] && !asset.thumbnailDataUrl ? <video src={asset.objectUrl} muted playsInline preload="auto" draggable={false} onLoadedData={(event) => { const duration = event.currentTarget.duration; event.currentTarget.currentTime = Number.isFinite(duration) && duration > 0.1 ? Math.min(0.15, duration / 2) : 0; }} /> : null}
                     {asset.kind === 'audio' ? <Music size={28} /> : null}
                     {!hasPreview && !previewLoading && asset.kind !== 'audio' ? (asset.kind === 'video' ? <Video size={28} /> : <ImageIcon size={28} />) : null}
                     {/* Show the shimmer and the spinner together until the preview is actually ready. */}

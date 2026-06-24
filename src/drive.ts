@@ -290,16 +290,38 @@ export function createDriveClient(): DriveClient {
     return response.blob();
   }
 
-  async function downloadThumbnail(fileId: string): Promise<Blob | undefined> {
-    const metadata = await driveJson<{ thumbnailLink?: string }>(
-      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=thumbnailLink`,
-      {},
-      'No se pudo leer la miniatura del asset.'
-    );
-    if (!metadata.thumbnailLink) return undefined;
-    const response = await driveFetch(metadata.thumbnailLink, {}, 'No se pudo descargar la miniatura del asset.');
-    if (!response.ok) return undefined;
-    return response.blob();
+  async function downloadThumbnail(fileId: string, cachedLink?: string): Promise<Blob | undefined> {
+    const fetchThumbnail = async (url: string) => {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 2500);
+      try {
+        const response = await driveFetch(url, { signal: controller.signal }, 'No se pudo descargar la miniatura del asset.');
+        return response.ok ? response.blob() : undefined;
+      } catch {
+        return undefined;
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    };
+    if (cachedLink) {
+      const cached = await fetchThumbnail(cachedLink);
+      if (cached) return cached;
+    }
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 2500);
+    try {
+      const metadata = await driveJson<{ thumbnailLink?: string }>(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=thumbnailLink`,
+        { signal: controller.signal },
+        'No se pudo leer la miniatura del asset.'
+      );
+      if (!metadata.thumbnailLink || metadata.thumbnailLink === cachedLink) return undefined;
+      return fetchThumbnail(metadata.thumbnailLink);
+    } catch {
+      return undefined;
+    } finally {
+      window.clearTimeout(timeout);
+    }
   }
 
   async function moveFile(fileId: string, destinationFolderId: string, previousFolderId: string): Promise<void> {

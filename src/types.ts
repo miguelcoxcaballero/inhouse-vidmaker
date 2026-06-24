@@ -38,6 +38,7 @@ export interface AssetRecord {
   width?: number;
   height?: number;
   metadataVersion?: number;
+  thumbnailLink?: string;
   thumbnailDataUrl?: string;
   objectUrl?: string;
   uploadState: 'local' | 'uploading' | 'uploaded' | 'error';
@@ -157,7 +158,7 @@ export interface DriveClient {
   restoreFile(fileId: string): Promise<void>;
   downloadJson<T>(fileId: string): Promise<T>;
   downloadFile(fileId: string): Promise<Blob>;
-  downloadThumbnail(fileId: string): Promise<Blob | undefined>;
+  downloadThumbnail(fileId: string, thumbnailLink?: string): Promise<Blob | undefined>;
   moveFile(fileId: string, destinationFolderId: string, previousFolderId: string): Promise<void>;
   uploadJson(name: string, data: unknown, parentId: string, appProperties?: Record<string, string>): Promise<DriveProjectFile>;
   patchJson(fileId: string, data: unknown, appProperties?: Record<string, string>): Promise<DriveProjectFile>;
