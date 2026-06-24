@@ -115,6 +115,7 @@ export interface ProjectRecord {
   rendersFolderId?: string;
   thumbsFolderId?: string;
   previewsFileId?: string;
+  previewDataUrl?: string;
   trashedAt?: string;
   createdAt: string;
   updatedAt: string;

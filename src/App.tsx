@@ -287,9 +287,11 @@ async function captureVideoThumbnails(objectUrl: string, count = 5, onFrame?: (i
   return frames;
 }
 
-// Resolve a preview thumbnail for a Drive-backed asset: prefer Drive's own generated
-// thumbnail, and if that's missing (common for many video files) download the actual
-// file and build one locally. Returns a data URL or undefined.
+// Resolve a preview thumbnail for a Drive-backed asset. Prefer Drive's own generated
+// thumbnail (cheap — no full download). For images we'll also build one from the file as
+// a fallback, but we deliberately DON'T download whole video files just for a preview:
+// that's slow, and the real frame gets captured for free while the clip is on the
+// timeline. Returns a data URL or undefined.
 async function resolveAssetThumbnail(drive: DriveClient, asset: AssetRecord): Promise<string | undefined> {
   if (asset.kind === 'audio' || !asset.driveFileId) return undefined;
   try {
@@ -299,17 +301,14 @@ async function resolveAssetThumbnail(drive: DriveClient, asset: AssetRecord): Pr
       if (dataUrl) return dataUrl;
     }
   } catch {
-    /* fall back to local generation */
+    /* fall back to local generation for images only */
   }
+  if (asset.kind !== 'image') return undefined;
   try {
     const blob = await drive.downloadFile(asset.driveFileId);
     const objectUrl = URL.createObjectURL(blob);
     try {
-      if (asset.kind === 'image') {
-        return (await captureImageThumbnail(objectUrl)) || undefined;
-      }
-      const frames = await captureVideoThumbnails(objectUrl, 5);
-      return frames[0];
+      return (await captureImageThumbnail(objectUrl)) || undefined;
     } finally {
       URL.revokeObjectURL(objectUrl);
     }
@@ -474,8 +473,10 @@ export function App() {
           homeThumbnailFailuresRef.current.add(jobKey);
           return;
         }
+        const isFirstFrame = projectFirstFrameAsset(target.project)?.id === target.asset.id;
         const updatedProject = {
           ...target.project,
+          previewDataUrl: isFirstFrame ? thumbnailDataUrl : target.project.previewDataUrl,
           assets: target.project.assets.map((asset) => asset.id === target.asset.id ? { ...asset, thumbnailDataUrl } : asset)
         };
         setProjects((current) => {
@@ -647,6 +648,20 @@ export function App() {
     })();
     return () => { cancelled = true; };
   }, [activeProjectId, drive]);
+
+  // Keep the project's preview as the frame of its first clip. The first-frame asset is
+  // loaded for playback while editing, so its poster is generated for free — we just copy
+  // it onto the project so the home card shows the real first frame, not a random asset.
+  useEffect(() => {
+    const project = activeProject;
+    if (!project) return;
+    const first = projectFirstFrameAsset(project);
+    if (!first) return;
+    const frame = first.thumbnailDataUrl || (first.kind === 'video' ? videoFrames[first.id]?.[0] : undefined);
+    if (frame && project.previewDataUrl !== frame) {
+      patchActiveProject((current) => ({ ...current, previewDataUrl: frame }), false);
+    }
+  }, [activeProject, videoFrames, patchActiveProject]);
 
   useEffect(() => {
     undoStackRef.current = [];
@@ -897,13 +912,17 @@ export function App() {
             const thumbnailDataUrl = await blobToDataUrl(blob).catch(() => '');
             if (thumbnailDataUrl) { setAssetThumbnail(assetId, thumbnailDataUrl); return true; }
           }
-          // Last resort: download the actual file and build the thumbnail ourselves.
-          try {
-            await ensureAssetLoaded(assetId, true);
-            const loaded = activeProjectRef.current?.assets.find((item) => item.id === assetId);
-            if (loaded?.objectUrl && await generateLocal(loaded.objectUrl)) return true;
-          } catch {
-            /* ignore — handled below */
+          // Images are small, so downloading them to build a thumbnail is fine. We avoid
+          // doing this for videos — pulling a whole video file just for a preview is slow;
+          // its poster is captured for free once the clip is loaded on the timeline.
+          if (asset.kind === 'image') {
+            try {
+              await ensureAssetLoaded(assetId, true);
+              const loaded = activeProjectRef.current?.assets.find((item) => item.id === assetId);
+              if (loaded?.objectUrl && await generateLocal(loaded.objectUrl)) return true;
+            } catch {
+              /* ignore — handled below */
+            }
           }
         }
         return false;
@@ -1854,17 +1873,18 @@ function ProjectCard(props: {
 }) {
   const [open, setOpen] = useState(false);
   const firstFrameAsset = projectFirstFrameAsset(props.project);
-  const firstFramePreview = firstFrameAsset?.thumbnailDataUrl || (firstFrameAsset?.kind === 'image' ? firstFrameAsset.objectUrl : undefined);
-  // Prefer the project's first frame, but if that frame can't be rendered yet (or ever,
-  // e.g. an undecodable codec with no Drive thumbnail) fall back to any visual asset that
-  // does have a thumbnail so the card never stays blank.
-  const fallbackPreview = firstFramePreview
-    ? undefined
-    : props.project.assets.find((asset) => !asset.trashedAt && asset.thumbnailDataUrl && (asset.kind === 'video' || asset.kind === 'image'))?.thumbnailDataUrl;
-  const previewSource = firstFramePreview || fallbackPreview;
-  // Only show the loading shimmer when a preview is genuinely on its way (the asset can
-  // be fetched from Drive); otherwise fall back to the duration placeholder.
-  const previewPending = !previewSource && !!firstFrameAsset?.driveFileId;
+  // Always the project's first frame: the dedicated project preview (captured from the
+  // first clip) or, failing that, the first-frame asset's own thumbnail. Never a random
+  // asset from the bin.
+  const previewSource = props.project.previewDataUrl
+    || firstFrameAsset?.thumbnailDataUrl
+    || (firstFrameAsset?.kind === 'image' ? firstFrameAsset.objectUrl : undefined);
+  // Show the loading shimmer only while previews are genuinely still being prepared (no
+  // asset has produced a thumbnail yet). Once some have but the first frame specifically
+  // isn't available, fall back to the duration placeholder instead of shimmering forever.
+  const previewPending = !previewSource
+    && !!firstFrameAsset?.driveFileId
+    && !props.project.assets.some((asset) => asset.thumbnailDataUrl);
   return (
     <article className={`drive-card ${props.compact ? 'compact' : ''}`} onDoubleClick={props.onOpen}>
       <button className="drive-card-open" onClick={props.onOpen} aria-label={`Abrir ${props.project.name}`}>
