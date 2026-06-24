@@ -212,16 +212,33 @@ async function captureImageThumbnail(objectUrl: string): Promise<string> {
 
 async function captureVideoThumbnails(objectUrl: string, count = 5, onFrame?: (index: number, dataUrl: string) => void): Promise<string[]> {
   const video = document.createElement('video');
-  video.src = objectUrl;
   video.muted = true;
   video.preload = 'auto';
   video.playsInline = true;
-  await new Promise<void>((resolve, reject) => {
-    if (video.readyState >= 2) resolve();
-    else video.onloadeddata = () => resolve();
-    video.onerror = () => reject(new Error('No se pudieron generar miniaturas.'));
+  video.crossOrigin = 'anonymous';
+  video.src = objectUrl;
+  // Wait for enough data to draw, but never hang forever and don't hard-fail on a
+  // transient error — we'll just bail later if the frame can't actually be decoded.
+  await new Promise<void>((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      window.clearTimeout(timer);
+      video.removeEventListener('loadeddata', finish);
+      video.removeEventListener('canplay', finish);
+      video.removeEventListener('error', finish);
+      resolve();
+    };
+    const timer = window.setTimeout(finish, 6000);
+    if (video.readyState >= 2) { finish(); return; }
+    video.addEventListener('loadeddata', finish);
+    video.addEventListener('canplay', finish);
+    video.addEventListener('error', finish);
     video.load();
   });
+  // If the browser couldn't decode the video there is nothing we can rasterise.
+  if (!video.videoWidth || !video.videoHeight) return [];
   const canvas = document.createElement('canvas');
   canvas.width = 160;
   canvas.height = 90;
@@ -248,16 +265,22 @@ async function captureVideoThumbnails(objectUrl: string, count = 5, onFrame?: (i
       video.currentTime = Math.max(0, time);
       if (video.readyState >= 2 && Math.abs(video.currentTime - time) < 0.02) finish();
     });
-    context.fillStyle = '#111111';
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    const sourceRatio = video.videoWidth / Math.max(1, video.videoHeight);
-    const targetRatio = canvas.width / canvas.height;
-    const width = sourceRatio >= targetRatio ? canvas.width : canvas.height * sourceRatio;
-    const height = sourceRatio >= targetRatio ? canvas.width / sourceRatio : canvas.height;
-    context.drawImage(video, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.68);
-    frames.push(dataUrl);
-    onFrame?.(index, dataUrl);
+    try {
+      context.fillStyle = '#111111';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      const sourceRatio = video.videoWidth / Math.max(1, video.videoHeight);
+      const targetRatio = canvas.width / canvas.height;
+      const width = sourceRatio >= targetRatio ? canvas.width : canvas.height * sourceRatio;
+      const height = sourceRatio >= targetRatio ? canvas.width / sourceRatio : canvas.height;
+      context.drawImage(video, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.68);
+      frames.push(dataUrl);
+      onFrame?.(index, dataUrl);
+    } catch {
+      // A frame failed to rasterise (e.g. a protected/undecodable sample) — keep whatever
+      // we have so far rather than throwing the whole capture away.
+      break;
+    }
   }
   video.removeAttribute('src');
   video.load();
@@ -419,13 +442,19 @@ export function App() {
   activeProjectRef.current = activeProject;
 
   useEffect(() => {
-    if (activeProjectId || !profile || homeThumbnailJobRef.current) return;
+    if (activeProjectId || !profile || !drive.accessToken || homeThumbnailJobRef.current) return;
     const target = projects.map((project) => {
-      // Prefer the project's first frame so the card matches what the project opens on.
-      const asset = projectFirstFrameAsset(project);
-      if (!asset || asset.thumbnailDataUrl || !asset.driveFileId) return undefined;
-      if (homeThumbnailFailuresRef.current.has(`${project.id}:${asset.id}`)) return undefined;
-      return { project, asset };
+      const visual = project.assets.filter((asset) => !asset.trashedAt && asset.driveFileId && (asset.kind === 'video' || asset.kind === 'image'));
+      // If any visual asset already has a thumbnail the card can render — nothing to do.
+      if (!visual.length || visual.some((asset) => asset.thumbnailDataUrl)) return undefined;
+      // Try the first frame first, then fall back to the project's other visual assets so
+      // the card still gets a preview if that exact frame can't be thumbnailed.
+      const firstFrame = projectFirstFrameAsset(project);
+      const ordered = firstFrame && visual.includes(firstFrame)
+        ? [firstFrame, ...visual.filter((asset) => asset !== firstFrame)]
+        : visual;
+      const asset = ordered.find((item) => !homeThumbnailFailuresRef.current.has(`${project.id}:${item.id}`));
+      return asset ? { project, asset } : undefined;
     }).find((entry): entry is { project: ProjectRecord; asset: AssetRecord } => !!entry);
     if (!target) return;
     const jobKey = `${target.project.id}:${target.asset.id}`;
@@ -459,7 +488,7 @@ export function App() {
         setHomeThumbnailVersion((version) => version + 1);
       }
     })();
-  }, [activeProjectId, homeThumbnailVersion, profile, projects]);
+  }, [activeProjectId, homeThumbnailVersion, profile, projects, drive.accessToken]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1757,7 +1786,14 @@ function ProjectCard(props: {
 }) {
   const [open, setOpen] = useState(false);
   const firstFrameAsset = projectFirstFrameAsset(props.project);
-  const previewSource = firstFrameAsset?.thumbnailDataUrl || (firstFrameAsset?.kind === 'image' ? firstFrameAsset.objectUrl : undefined);
+  const firstFramePreview = firstFrameAsset?.thumbnailDataUrl || (firstFrameAsset?.kind === 'image' ? firstFrameAsset.objectUrl : undefined);
+  // Prefer the project's first frame, but if that frame can't be rendered yet (or ever,
+  // e.g. an undecodable codec with no Drive thumbnail) fall back to any visual asset that
+  // does have a thumbnail so the card never stays blank.
+  const fallbackPreview = firstFramePreview
+    ? undefined
+    : props.project.assets.find((asset) => !asset.trashedAt && asset.thumbnailDataUrl && (asset.kind === 'video' || asset.kind === 'image'))?.thumbnailDataUrl;
+  const previewSource = firstFramePreview || fallbackPreview;
   // Only show the loading shimmer when a preview is genuinely on its way (the asset can
   // be fetched from Drive); otherwise fall back to the duration placeholder.
   const previewPending = !previewSource && !!firstFrameAsset?.driveFileId;
