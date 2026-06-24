@@ -2723,6 +2723,7 @@ function EditorView(props: {
 }) {
   const [playhead, setPlayhead] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [mediaReadyVersion, setMediaReadyVersion] = useState(0);
   const [editorProfileOpen, setEditorProfileOpen] = useState(false);
   const [selectedClipId, setSelectedClipId] = useState<string | undefined>();
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
@@ -2765,6 +2766,8 @@ function EditorView(props: {
   const cancelProjectTitleEditRef = useRef(false);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const audioRefs = useRef(new Map<string, HTMLAudioElement>());
+  const bufferingVideoIdsRef = useRef(new Set<string>());
+  const playbackMediaRef = useRef<{ clips: TimelineItem[]; assets: AssetRecord[] }>({ clips: [], assets: [] });
   const clipboardClipsRef = useRef<TimelineItem[]>([]);
   const thumbnailJobRef = useRef<string | undefined>(undefined);
   const thumbnailFailuresRef = useRef(new Set<string>());
@@ -2854,6 +2857,14 @@ function EditorView(props: {
   const preparedVisualClips = [...activeVisualClips, ...upcomingVisualClips]
     .filter((clip, index, clips) => clips.findIndex((candidate) => candidate.id === clip.id) === index)
     .sort((a, b) => props.project.tracks.findIndex((track) => track.id === b.trackId) - props.project.tracks.findIndex((track) => track.id === a.trackId));
+  playbackMediaRef.current = { clips: activeVisualClips, assets: props.project.assets };
+  const previewBuffering = playing && activeVisualClips.some((clip) => {
+    const asset = clip.assetId ? props.project.assets.find((item) => item.id === clip.assetId) : undefined;
+    if (!asset?.objectUrl) return true;
+    if (clip.type !== 'video') return false;
+    const video = videoRefs.current.get(clip.id);
+    return !video || bufferingVideoIdsRef.current.has(clip.id) || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.seeking;
+  });
   const activeAudioAsset = activeAudioClips[0]?.assetId ? props.project.assets.find((asset) => asset.id === activeAudioClips[0].assetId) : undefined;
   const timelineMediaEnd = props.project.timeline.length
     ? Math.max(...props.project.timeline.map((clip) => clip.start + clip.duration))
@@ -2887,6 +2898,26 @@ function EditorView(props: {
   const splittableClipIds = (selectedClipIds.length ? props.project.timeline.filter((clip) => selectedClipIds.includes(clip.id)) : props.project.timeline)
     .filter((clip) => playhead > clip.start + 1 / props.project.fps && playhead < clip.start + clip.duration - 1 / props.project.fps)
     .map((clip) => clip.id);
+
+  const togglePlayback = () => {
+    if (playing) {
+      setPlaying(false);
+      return;
+    }
+    [...activeVisualClips, ...activeAudioClips].forEach((clip) => {
+      const media = clip.type === 'video' ? videoRefs.current.get(clip.id) : clip.type === 'audio' ? audioRefs.current.get(clip.id) : undefined;
+      if (media && media.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && !media.seeking && !clip.reverse) {
+        void media.play().catch(() => undefined);
+      }
+    });
+    setPlaying(true);
+  };
+
+  const markVideoBuffering = (clipId: string, buffering: boolean) => {
+    if (buffering) bufferingVideoIdsRef.current.add(clipId);
+    else bufferingVideoIdsRef.current.delete(clipId);
+    setMediaReadyVersion((version) => version + 1);
+  };
 
   useEffect(() => {
     if (!projectTitleEditingRef.current && projectTitleRef.current) {
@@ -3086,7 +3117,7 @@ function EditorView(props: {
         setPlayhead((current) => clamp(current + direction / props.project.fps, 0, props.project.duration));
       } else if (event.code === 'Space') {
         event.preventDefault();
-        setPlaying((current) => !current);
+        togglePlayback();
       }
     };
     window.addEventListener('keydown', handleEditorShortcut);
@@ -3103,8 +3134,13 @@ function EditorView(props: {
       const localTime = Math.max(0, playhead - clip.start);
       const clipTime = Math.max(0, (clip.trimStart || 0) + (clip.reverse ? clip.duration * rate - localTime * rate - 1 / props.project.fps : localTime * rate));
       video.playbackRate = rate;
+      if (video.readyState < HTMLMediaElement.HAVE_METADATA) return;
       if (!playing || Math.abs(video.currentTime - clipTime) > 0.25) video.currentTime = clipTime;
-      if (playing && !clip.reverse) void video.play().catch(() => setPlaying(false));
+      if (playing && !clip.reverse && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && !video.seeking) {
+        void video.play().catch((error: unknown) => {
+          if (error instanceof DOMException && error.name === 'NotAllowedError') setPlaying(false);
+        });
+      }
       else video.pause();
     });
     activeAudioClips.forEach((clip) => {
@@ -3115,11 +3151,16 @@ function EditorView(props: {
       const localTime = Math.max(0, playhead - clip.start);
       const clipTime = Math.max(0, (clip.trimStart || 0) + (clip.reverse ? clip.duration * rate - localTime * rate - 1 / props.project.fps : localTime * rate));
       audio.playbackRate = rate;
+      if (audio.readyState < HTMLMediaElement.HAVE_METADATA) return;
       if (!playing || Math.abs(audio.currentTime - clipTime) > 0.25) audio.currentTime = clipTime;
-      if (playing && !clip.reverse) void audio.play().catch(() => setPlaying(false));
+      if (playing && !clip.reverse && audio.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && !audio.seeking) {
+        void audio.play().catch((error: unknown) => {
+          if (error instanceof DOMException && error.name === 'NotAllowedError') setPlaying(false);
+        });
+      }
       else audio.pause();
     });
-  }, [playhead, playing, activeVisualClips, activeAudioClips, props.project.tracks]);
+  }, [playhead, playing, activeVisualClips, activeAudioClips, props.project.tracks, mediaReadyVersion]);
 
   // Decode the first frame of clips that are about to start so they appear instantly.
   useEffect(() => {
@@ -3133,7 +3174,7 @@ function EditorView(props: {
       }
       video.pause();
     });
-  }, [upcomingVisualClips, props.project.fps]);
+  }, [upcomingVisualClips, props.project.fps, mediaReadyVersion]);
 
   const seekFromPointer = (event: ReactPointerEvent<HTMLElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -3659,6 +3700,19 @@ function EditorView(props: {
     const tick = (now: number) => {
       const elapsed = Math.max(0, now - previous);
       previous = now;
+      const playback = playbackMediaRef.current;
+      const buffering = playback.clips.some((clip) => {
+        const asset = clip.assetId ? playback.assets.find((item) => item.id === clip.assetId) : undefined;
+        if (!asset?.objectUrl) return true;
+        if (clip.type !== 'video') return false;
+        const video = videoRefs.current.get(clip.id);
+        return !video || bufferingVideoIdsRef.current.has(clip.id) || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.seeking;
+      });
+      if (buffering) {
+        accumulated = 0;
+        frame = window.requestAnimationFrame(tick);
+        return;
+      }
       accumulated += elapsed;
       if (accumulated >= frameInterval) {
         const advance = accumulated / 1000;
@@ -3934,7 +3988,28 @@ function EditorView(props: {
                     onPointerDown={(event) => beginTransform(event, clip, 'move')}
                   >
                     {asset.kind === 'video' ? (
-                      <video ref={(node) => { if (node) videoRefs.current.set(clip.id, node); else videoRefs.current.delete(clip.id); }} src={asset.objectUrl} poster={asset.thumbnailDataUrl} playsInline controls={false} draggable={false} preload="auto" style={{ objectFit: clip.transform.fit, transform: `scaleX(${clip.transform.flipX ? -1 : 1}) scaleY(${clip.transform.flipY ? -1 : 1})` }} />
+                      <video
+                        ref={(node) => {
+                          if (node) videoRefs.current.set(clip.id, node);
+                          else {
+                            videoRefs.current.delete(clip.id);
+                            bufferingVideoIdsRef.current.delete(clip.id);
+                          }
+                        }}
+                        src={asset.objectUrl}
+                        poster={asset.thumbnailDataUrl}
+                        playsInline
+                        controls={false}
+                        draggable={false}
+                        preload="auto"
+                        onLoadedMetadata={() => setMediaReadyVersion((version) => version + 1)}
+                        onLoadedData={() => setMediaReadyVersion((version) => version + 1)}
+                        onCanPlay={() => markVideoBuffering(clip.id, false)}
+                        onPlaying={() => markVideoBuffering(clip.id, false)}
+                        onSeeked={() => setMediaReadyVersion((version) => version + 1)}
+                        onWaiting={() => markVideoBuffering(clip.id, true)}
+                        style={{ objectFit: clip.transform.fit, transform: `scaleX(${clip.transform.flipX ? -1 : 1}) scaleY(${clip.transform.flipY ? -1 : 1})` }}
+                      />
                     ) : (
                       <img src={asset.objectUrl} alt="" draggable={false} style={{ objectFit: clip.transform.fit, transform: `scaleX(${clip.transform.flipX ? -1 : 1}) scaleY(${clip.transform.flipY ? -1 : 1})` }} />
                     )}
@@ -3994,13 +4069,17 @@ function EditorView(props: {
                     ref={(node) => { if (node) audioRefs.current.set(clip.id, node); else audioRefs.current.delete(clip.id); }}
                     src={asset.objectUrl}
                     preload="auto"
+                    onLoadedMetadata={() => setMediaReadyVersion((version) => version + 1)}
+                    onCanPlay={() => setMediaReadyVersion((version) => version + 1)}
+                    onSeeked={() => setMediaReadyVersion((version) => version + 1)}
                   />
                 ) : null;
               })}
+              {previewBuffering ? <span className="preview-spinner playback-loading" aria-label="Cargando video" /> : null}
             </div>
           </div>
           <div className="transport">
-            <button className="btn btn-secondary btn-icon-square" onClick={() => setPlaying((value) => !value)}>
+            <button className="btn btn-secondary btn-icon-square" onClick={togglePlayback}>
               {playing ? <Pause size={18} /> : <Play size={18} />}
             </button>
             <input

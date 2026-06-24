@@ -1786,6 +1786,15 @@ button {
   max-height: 100%;
 }
 
+.preview-spinner.playback-loading {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  z-index: 100;
+  filter: drop-shadow(0 1px 5px #000);
+  pointer-events: none;
+}
+
 .preview-hud {
   position: absolute;
   top: 16px;
