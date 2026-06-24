@@ -311,6 +311,7 @@ export function App() {
   const [focusedClipId, setFocusedClipId] = useState<string | undefined>();
   const [historyVersion, setHistoryVersion] = useState(0);
   const [exportProgress, setExportProgress] = useState<number | null>(null);
+  const [homeThumbnailVersion, setHomeThumbnailVersion] = useState(0);
   const syncTimerRef = useRef<number | null>(null);
   const syncPromiseRef = useRef<Promise<void> | null>(null);
   const syncQueuedRef = useRef(false);
@@ -322,12 +323,61 @@ export function App() {
   const assetBlobCacheRef = useRef(new Map<string, Blob>());
   const assetLoadPromisesRef = useRef(new Map<string, Promise<void>>());
   const assetThumbnailPromisesRef = useRef(new Map<string, Promise<boolean>>());
+  const homeThumbnailJobRef = useRef<string | undefined>(undefined);
+  const homeThumbnailFailuresRef = useRef(new Set<string>());
 
   const activeProject = useMemo(
     () => projects.find((project) => project.id === activeProjectId),
     [activeProjectId, projects]
   );
   activeProjectRef.current = activeProject;
+
+  useEffect(() => {
+    if (activeProjectId || !profile || homeThumbnailJobRef.current) return;
+    const target = projects.map((project) => {
+      const visualAssets = project.assets.filter((asset) => !asset.trashedAt && (asset.kind === 'video' || asset.kind === 'image'));
+      if (visualAssets.some((asset) => asset.thumbnailDataUrl)) return undefined;
+      const asset = visualAssets.find((item) => item.driveFileId && !homeThumbnailFailuresRef.current.has(`${project.id}:${item.id}`));
+      return asset ? { project, asset } : undefined;
+    }).find((entry): entry is { project: ProjectRecord; asset: AssetRecord } => !!entry);
+    if (!target) return;
+    const jobKey = `${target.project.id}:${target.asset.id}`;
+    homeThumbnailJobRef.current = jobKey;
+    void (async () => {
+      try {
+        const blob = await drive.downloadThumbnail(target.asset.driveFileId!);
+        if (!blob) {
+          homeThumbnailFailuresRef.current.add(jobKey);
+          return;
+        }
+        const thumbnailDataUrl = await blobToDataUrl(blob);
+        if (!thumbnailDataUrl) {
+          homeThumbnailFailuresRef.current.add(jobKey);
+          return;
+        }
+        const updatedProject = {
+          ...target.project,
+          assets: target.project.assets.map((asset) => asset.id === target.asset.id ? { ...asset, thumbnailDataUrl } : asset)
+        };
+        setProjects((current) => {
+          const next = current.map((project) => project.id === updatedProject.id ? updatedProject : project);
+          persistStoredState(next, activeProjectId);
+          return next;
+        });
+        if (updatedProject.projectFileId && updatedProject.folderId) {
+          await drive.patchJson(updatedProject.projectFileId, {
+            ...updatedProject,
+            assets: updatedProject.assets.map((asset) => ({ ...asset, objectUrl: undefined }))
+          }, { [PROJECT_APP_PROPERTY]: '1' });
+        }
+      } catch {
+        homeThumbnailFailuresRef.current.add(jobKey);
+      } finally {
+        homeThumbnailJobRef.current = undefined;
+        setHomeThumbnailVersion((version) => version + 1);
+      }
+    })();
+  }, [activeProjectId, homeThumbnailVersion, profile, projects]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1586,13 +1636,15 @@ function ProjectCard(props: {
   onDelete(): void;
 }) {
   const [open, setOpen] = useState(false);
-  const firstAsset = props.project.assets.find((asset) => asset.kind === 'video' || asset.kind === 'image');
+  const visualAssets = props.project.assets.filter((asset) => !asset.trashedAt && (asset.kind === 'video' || asset.kind === 'image'));
+  const firstAsset = visualAssets.find((asset) => asset.thumbnailDataUrl) || visualAssets[0];
+  const previewSource = firstAsset?.thumbnailDataUrl || (firstAsset?.kind === 'image' ? firstAsset.objectUrl : undefined);
   return (
     <article className={`drive-card ${props.compact ? 'compact' : ''}`} onDoubleClick={props.onOpen}>
       <button className="drive-card-open" onClick={props.onOpen} aria-label={`Abrir ${props.project.name}`}>
         <div className="drive-card-preview">
-          {firstAsset?.objectUrl && firstAsset.kind === 'image' ? (
-            <img src={firstAsset.objectUrl} alt="" />
+          {previewSource ? (
+            <img src={previewSource} alt="" />
           ) : (
             <div className="video-preview-mark">
               <Video size={34} />
