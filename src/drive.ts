@@ -290,6 +290,18 @@ export function createDriveClient(): DriveClient {
     return response.blob();
   }
 
+  async function downloadThumbnail(fileId: string): Promise<Blob | undefined> {
+    const metadata = await driveJson<{ thumbnailLink?: string }>(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=thumbnailLink`,
+      {},
+      'No se pudo leer la miniatura del asset.'
+    );
+    if (!metadata.thumbnailLink) return undefined;
+    const response = await driveFetch(metadata.thumbnailLink, {}, 'No se pudo descargar la miniatura del asset.');
+    if (!response.ok) return undefined;
+    return response.blob();
+  }
+
   async function moveFile(fileId: string, destinationFolderId: string, previousFolderId: string): Promise<void> {
     const params = new URLSearchParams({
       addParents: destinationFolderId,
@@ -430,6 +442,7 @@ export function createDriveClient(): DriveClient {
     restoreFile,
     downloadJson,
     downloadFile,
+    downloadThumbnail,
     moveFile,
     uploadJson,
     patchJson,

@@ -159,6 +159,38 @@ function readAssetMetadata(kind: AssetRecord['kind'], objectUrl: string): Promis
   });
 }
 
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('No se pudo leer la miniatura.'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function captureImageThumbnail(objectUrl: string): Promise<string> {
+  const image = new Image();
+  image.src = objectUrl;
+  await new Promise<void>((resolve, reject) => {
+    if (image.complete && image.naturalWidth) resolve();
+    else image.onload = () => resolve();
+    image.onerror = () => reject(new Error('No se pudo generar la miniatura.'));
+  });
+  const canvas = document.createElement('canvas');
+  canvas.width = 160;
+  canvas.height = 90;
+  const context = canvas.getContext('2d');
+  if (!context) return '';
+  context.fillStyle = '#111111';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  const sourceRatio = image.naturalWidth / Math.max(1, image.naturalHeight);
+  const targetRatio = canvas.width / canvas.height;
+  const width = sourceRatio >= targetRatio ? canvas.width : canvas.height * sourceRatio;
+  const height = sourceRatio >= targetRatio ? canvas.width / sourceRatio : canvas.height;
+  context.drawImage(image, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
+  return canvas.toDataURL('image/jpeg', 0.72);
+}
+
 async function captureVideoThumbnails(objectUrl: string, count = 5): Promise<string[]> {
   const video = document.createElement('video');
   video.src = objectUrl;
@@ -289,6 +321,7 @@ export function App() {
   const activeProjectRef = useRef<ProjectRecord | undefined>(undefined);
   const assetBlobCacheRef = useRef(new Map<string, Blob>());
   const assetLoadPromisesRef = useRef(new Map<string, Promise<void>>());
+  const assetThumbnailPromisesRef = useRef(new Map<string, Promise<boolean>>());
 
   const activeProject = useMemo(
     () => projects.find((project) => project.id === activeProjectId),
@@ -539,8 +572,8 @@ export function App() {
         const assets = project.assets.map((asset) => {
           const local = localProject?.assets.find((item) => item.id === asset.id || (!!item.driveFileId && item.driveFileId === asset.driveFileId));
           return local?.objectUrl
-            ? { ...asset, objectUrl: local.objectUrl, uploadState: local.uploadState }
-            : { ...asset, objectUrl: undefined, uploadState: asset.driveFileId ? 'uploaded' as const : asset.uploadState };
+            ? { ...asset, thumbnailDataUrl: asset.thumbnailDataUrl || local.thumbnailDataUrl, objectUrl: local.objectUrl, uploadState: local.uploadState }
+            : { ...asset, thumbnailDataUrl: asset.thumbnailDataUrl || local?.thumbnailDataUrl, objectUrl: undefined, uploadState: asset.driveFileId ? 'uploaded' as const : asset.uploadState };
         });
         return { ...project, assets, projectFileId: file.id, trashedAt: undefined, updatedAt: project.updatedAt || file.modifiedTime || nowIso() };
       }));
@@ -593,6 +626,44 @@ export function App() {
       }
     })();
     assetLoadPromisesRef.current.set(assetId, promise);
+    return promise;
+  }
+
+  function setAssetThumbnail(assetId: string, thumbnailDataUrl: string) {
+    if (!thumbnailDataUrl) return;
+    patchActiveProject((project) => {
+      const asset = project.assets.find((item) => item.id === assetId);
+      if (!asset || asset.thumbnailDataUrl === thumbnailDataUrl) return project;
+      return {
+        ...project,
+        assets: project.assets.map((item) => item.id === assetId ? { ...item, thumbnailDataUrl } : item)
+      };
+    }, false);
+  }
+
+  async function ensureAssetThumbnail(assetId: string): Promise<boolean> {
+    const project = activeProjectRef.current;
+    const asset = project?.assets.find((item) => item.id === assetId);
+    if (!project || !asset) return false;
+    if (asset.thumbnailDataUrl) return true;
+    if (!asset.driveFileId) return false;
+    const pending = assetThumbnailPromisesRef.current.get(assetId);
+    if (pending) return pending;
+    const promise = (async () => {
+      try {
+        const blob = await drive.downloadThumbnail(asset.driveFileId!);
+        if (!blob) return false;
+        const thumbnailDataUrl = await blobToDataUrl(blob);
+        if (!thumbnailDataUrl) return false;
+        setAssetThumbnail(assetId, thumbnailDataUrl);
+        return true;
+      } catch {
+        return false;
+      } finally {
+        assetThumbnailPromisesRef.current.delete(assetId);
+      }
+    })();
+    assetThumbnailPromisesRef.current.set(assetId, promise);
     return promise;
   }
 
@@ -762,6 +833,9 @@ export function App() {
           assets: project.assets.map((entry) => entry.id === asset.id ? { ...entry, ...metadata } : entry)
         }), false);
       });
+      if (kind === 'image') {
+        void captureImageThumbnail(objectUrl).then((thumbnailDataUrl) => setAssetThumbnail(asset.id, thumbnailDataUrl)).catch(() => undefined);
+      }
       const uploadFolderId = destinationFolderId || activeProject.assetsFolderId;
       if (drive.accessToken && uploadFolderId) {
         try {
@@ -1202,6 +1276,8 @@ export function App() {
         onSignOut={signOut}
         onFiles={addFiles}
         onEnsureAssetLoaded={ensureAssetLoaded}
+        onEnsureAssetThumbnail={ensureAssetThumbnail}
+        onSetAssetThumbnail={setAssetThumbnail}
         onRetryAsset={retryAsset}
         onDragOver={onDragOver}
         onDragLeave={() => setDragging(false)}
@@ -2145,6 +2221,8 @@ function EditorView(props: {
   onSignOut(): void;
   onFiles(files: FileList | File[], destinationFolderId?: string): void;
   onEnsureAssetLoaded(assetId: string, quiet?: boolean): Promise<void>;
+  onEnsureAssetThumbnail(assetId: string): Promise<boolean>;
+  onSetAssetThumbnail(assetId: string, thumbnailDataUrl: string): void;
   onRetryAsset(assetId: string): void;
   onDragOver(event: DragEvent<HTMLElement>): void;
   onDragLeave(): void;
@@ -2193,6 +2271,7 @@ function EditorView(props: {
   const [mobilePanel, setMobilePanel] = useState<'assets' | 'preview' | 'inspector'>('preview');
   const [renamingTrackId, setRenamingTrackId] = useState<string | undefined>();
   const [videoThumbnails, setVideoThumbnails] = useState<Record<string, string[]>>({});
+  const [thumbnailQueueVersion, setThumbnailQueueVersion] = useState(0);
   const [assetPanelWidth, setAssetPanelWidth] = useState(getDefaultSidePanelWidth);
   const [inspectorPanelWidth, setInspectorPanelWidth] = useState(getDefaultSidePanelWidth);
   const [timelineHeight, setTimelineHeight] = useState(getDefaultTimelineHeight);
@@ -2220,6 +2299,8 @@ function EditorView(props: {
   const clipboardClipsRef = useRef<TimelineItem[]>([]);
   const thumbnailJobRef = useRef<string | undefined>(undefined);
   const thumbnailFailuresRef = useRef(new Set<string>());
+  const remoteThumbnailJobRef = useRef<string | undefined>(undefined);
+  const remoteThumbnailFailuresRef = useRef(new Set<string>());
   const editorMountedRef = useRef(true);
   const appliedFocusRef = useRef<string | undefined>(undefined);
   const tracksRef = useRef<HTMLDivElement>(null);
@@ -2378,6 +2459,7 @@ function EditorView(props: {
     thumbnailJobRef.current = asset.id;
     void captureVideoThumbnails(asset.objectUrl!).then((frames) => {
       if (!frames.length) thumbnailFailuresRef.current.add(asset.id);
+      if (frames[0] && !asset.thumbnailDataUrl) props.onSetAssetThumbnail(asset.id, frames[0]);
       if (editorMountedRef.current) setVideoThumbnails((current) => frames.length ? { ...current, [asset.id]: frames } : { ...current });
     }).catch(() => {
       thumbnailFailuresRef.current.add(asset.id);
@@ -2386,6 +2468,21 @@ function EditorView(props: {
       thumbnailJobRef.current = undefined;
     });
   }, [props.project.assets, videoThumbnails]);
+
+  useEffect(() => {
+    if (remoteThumbnailJobRef.current) return;
+    const asset = props.project.assets.find((item) =>
+      (item.kind === 'video' || item.kind === 'image') && item.driveFileId && !item.thumbnailDataUrl && !remoteThumbnailFailuresRef.current.has(item.id)
+    );
+    if (!asset) return;
+    remoteThumbnailJobRef.current = asset.id;
+    void props.onEnsureAssetThumbnail(asset.id).then((available) => {
+      if (!available) remoteThumbnailFailuresRef.current.add(asset.id);
+    }).finally(() => {
+      remoteThumbnailJobRef.current = undefined;
+      if (editorMountedRef.current) setThumbnailQueueVersion((version) => version + 1);
+    });
+  }, [props.onEnsureAssetThumbnail, props.project.assets, thumbnailQueueVersion]);
 
   useEffect(() => {
     const validIds = selectedClipIds.filter((id) => props.project.timeline.some((clip) => clip.id === id));
@@ -3136,11 +3233,11 @@ function EditorView(props: {
                   title="Arrastra a la timeline o haz doble clic"
                 >
                   <span className={`asset-thumbnail ${asset.kind}`}>
-                    {asset.objectUrl && asset.kind === 'image' ? <img src={asset.objectUrl} alt="" draggable={false} /> : null}
-                    {asset.kind === 'video' && videoThumbnails[asset.id]?.[0] ? <img src={videoThumbnails[asset.id][0]} alt="" draggable={false} /> : null}
-                    {asset.objectUrl && asset.kind === 'video' && !videoThumbnails[asset.id]?.[0] ? <video src={asset.objectUrl} muted playsInline preload="auto" draggable={false} onLoadedData={(event) => { const duration = event.currentTarget.duration; event.currentTarget.currentTime = Number.isFinite(duration) && duration > 0.1 ? Math.min(0.15, duration / 2) : 0; }} /> : null}
+                    {asset.kind === 'image' && (asset.thumbnailDataUrl || asset.objectUrl) ? <img src={asset.thumbnailDataUrl || asset.objectUrl} alt="" draggable={false} /> : null}
+                    {asset.kind === 'video' && (videoThumbnails[asset.id]?.[0] || asset.thumbnailDataUrl) ? <img src={videoThumbnails[asset.id]?.[0] || asset.thumbnailDataUrl} alt="" draggable={false} /> : null}
+                    {asset.objectUrl && asset.kind === 'video' && !videoThumbnails[asset.id]?.[0] && !asset.thumbnailDataUrl ? <video src={asset.objectUrl} muted playsInline preload="auto" draggable={false} onLoadedData={(event) => { const duration = event.currentTarget.duration; event.currentTarget.currentTime = Number.isFinite(duration) && duration > 0.1 ? Math.min(0.15, duration / 2) : 0; }} /> : null}
                     {asset.kind === 'audio' ? <Music size={28} /> : null}
-                    {!asset.objectUrl && asset.kind !== 'audio' ? (asset.kind === 'video' ? <Video size={28} /> : <ImageIcon size={28} />) : null}
+                    {!asset.objectUrl && !asset.thumbnailDataUrl && asset.kind !== 'audio' ? (asset.kind === 'video' ? <Video size={28} /> : <ImageIcon size={28} />) : null}
                     {asset.uploadState === 'uploading' ? <Loader2 className="asset-loading spin" size={20} /> : null}
                   </span>
                   <span className="asset-copy"><strong>{asset.name}</strong><span>{formatBytes(asset.size)} - {asset.uploadState === 'error' ? 'error' : asset.uploadState === 'uploading' ? 'cargando' : 'listo'}</span></span>
@@ -3566,7 +3663,8 @@ function EditorView(props: {
                         <button className="clip-trim-handle start" aria-label="Ajustar inicio" onPointerDown={(event) => beginTrim(event, clip, 'start')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
                         {clip.transition?.type && clip.transition.type !== 'none' ? <span className={`clip-transition ${clip.transition.type}`} style={{ width: `${Math.min(100, (clip.transition.duration / Math.max(0.01, clip.duration)) * 100)}%` }} title={`${clip.transition.type} ${clip.transition.duration}s`} /> : null}
                         {asset?.kind === 'video' && videoThumbnails[asset.id]?.length ? <span className="clip-thumbnail-strip">{videoThumbnails[asset.id].map((frame, index) => <img key={`${asset.id}_${index}`} src={frame} alt="" draggable={false} />)}</span> : null}
-                        {asset?.kind === 'image' && asset.objectUrl ? <span className="clip-thumbnail-strip single"><img src={asset.objectUrl} alt="" draggable={false} /></span> : null}
+                        {asset?.kind === 'video' && !videoThumbnails[asset.id]?.length && asset.thumbnailDataUrl ? <span className="clip-thumbnail-strip single"><img src={asset.thumbnailDataUrl} alt="" draggable={false} /></span> : null}
+                        {asset?.kind === 'image' && (asset.thumbnailDataUrl || asset.objectUrl) ? <span className="clip-thumbnail-strip single"><img src={asset.thumbnailDataUrl || asset.objectUrl} alt="" draggable={false} /></span> : null}
                         <span className="clip-title">{clip.type === 'text' ? (clip.text || 'Texto') : (asset?.name || clip.type)}</span>
                         <button className="clip-trim-handle end" aria-label="Ajustar final" onPointerDown={(event) => beginTrim(event, clip, 'end')} onPointerMove={updateTrim} onPointerUp={endTrim} onPointerCancel={endTrim} />
                       </div>
