@@ -37,6 +37,7 @@ export interface AssetRecord {
   duration?: number;
   width?: number;
   height?: number;
+  metadataVersion?: number;
   thumbnailDataUrl?: string;
   objectUrl?: string;
   uploadState: 'local' | 'uploading' | 'uploaded' | 'error';
@@ -116,6 +117,7 @@ export interface ProjectRecord {
   thumbsFolderId?: string;
   previewsFileId?: string;
   previewDataUrl?: string;
+  previewSignature?: string;
   trashedAt?: string;
   createdAt: string;
   updatedAt: string;

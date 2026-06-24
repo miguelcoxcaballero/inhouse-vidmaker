@@ -133,6 +133,68 @@ function drawText(context: CanvasRenderingContext2D, project: ProjectRecord, cli
   context.restore();
 }
 
+export async function renderProjectPreview(project: ProjectRecord, time = 0): Promise<string> {
+  const canvas = document.createElement('canvas');
+  canvas.width = 320;
+  canvas.height = Math.max(2, Math.round(canvas.width * project.height / project.width));
+  const context = canvas.getContext('2d', { alpha: false });
+  if (!context) throw new Error('No se pudo generar la preview del proyecto.');
+
+  const assets = new Map(project.assets.map((asset) => [asset.id, asset]));
+  const inputs = new Map<string, Input<BlobSource>>();
+  const getBlob = async (asset: AssetRecord) => {
+    if (!asset.objectUrl) throw new Error(`No se puede cargar ${asset.name}.`);
+    const response = await fetch(asset.objectUrl);
+    if (!response.ok) throw new Error(`No se puede leer ${asset.name}.`);
+    return response.blob();
+  };
+  const getInput = async (asset: AssetRecord) => {
+    let input = inputs.get(asset.id);
+    if (!input) {
+      input = new Input({ source: new BlobSource(await getBlob(asset)), formats: ALL_FORMATS });
+      inputs.set(asset.id, input);
+    }
+    return input;
+  };
+  const clips = project.timeline
+    .filter((clip) => (clip.type === 'video' || clip.type === 'image' || clip.type === 'text')
+      && time >= clip.start && time < clip.start + clip.duration
+      && !trackFor(project, clip)?.hidden)
+    .sort((a, b) => trackIndex(project, b) - trackIndex(project, a));
+
+  context.setTransform(canvas.width / project.width, 0, 0, canvas.height / project.height, 0, 0);
+  context.fillStyle = '#000000';
+  context.fillRect(0, 0, project.width, project.height);
+  try {
+    for (const clip of clips) {
+      if (clip.type === 'text') {
+        drawText(context, project, clip, time);
+        continue;
+      }
+      const asset = clip.assetId ? assets.get(clip.assetId) : undefined;
+      if (!asset) continue;
+      if (clip.type === 'image') {
+        const image = await createImageBitmap(await getBlob(asset));
+        drawMedia(context, project, clip, time, image.width, image.height, (sx, sy, sw, sh, x, y, width, height) => context.drawImage(image, sx, sy, sw, sh, x, y, width, height));
+        image.close();
+        continue;
+      }
+      const input = await getInput(asset);
+      const track = await input.getPrimaryVideoTrack();
+      if (!track || !(await track.canDecode())) continue;
+      const rate = clip.playbackRate || 1;
+      const sourceTime = (clip.trimStart || 0) + (clip.reverse ? Math.max(0, clip.duration * rate - 1 / project.fps) : 0);
+      const sample = await new VideoSampleSink(track).getSample(sourceTime);
+      if (!sample) continue;
+      drawMedia(context, project, clip, time, sample.displayWidth, sample.displayHeight, (sx, sy, sw, sh, x, y, width, height) => sample.draw(context, sx, sy, sw, sh, x, y, width, height));
+      sample.close();
+    }
+    return canvas.toDataURL('image/jpeg', 0.78);
+  } finally {
+    inputs.forEach((input) => input.dispose());
+  }
+}
+
 function reverseAudioSlice(context: OfflineAudioContext, source: AudioBuffer, offset: number, duration: number) {
   const start = Math.max(0, Math.floor(offset * source.sampleRate));
   const length = Math.max(1, Math.min(source.length - start, Math.floor(duration * source.sampleRate)));

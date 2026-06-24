@@ -139,43 +139,60 @@ function projectCardMeta(project: ProjectRecord) {
   return `${formatWhen(project.updatedAt)} · ${clips} clips · ${assets} assets`;
 }
 
-function readAssetMetadata(kind: AssetRecord['kind'], objectUrl: string): Promise<Pick<AssetRecord, 'duration' | 'width' | 'height'>> {
-  return new Promise((resolve) => {
-    if (kind === 'image') {
+async function readAssetMetadata(kind: AssetRecord['kind'], objectUrl: string): Promise<Pick<AssetRecord, 'duration' | 'width' | 'height'>> {
+  if (kind === 'image') {
+    return new Promise((resolve) => {
       const image = new Image();
       image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
       image.onerror = () => resolve({});
       image.src = objectUrl;
-      return;
-    }
-    const media = document.createElement(kind === 'video' ? 'video' : 'audio');
-    media.preload = 'metadata';
-    const dimensions = () => ({
-      width: kind === 'video' ? (media as HTMLVideoElement).videoWidth : undefined,
-      height: kind === 'video' ? (media as HTMLVideoElement).videoHeight : undefined
     });
-    const finalize = (duration: number) => resolve({
-      duration: Number.isFinite(duration) && duration > 0 ? duration : undefined,
-      ...dimensions()
-    });
-    media.onloadedmetadata = () => {
-      // Some containers (notably WebM from MediaRecorder) report Infinity/NaN until the
-      // element is seeked past the end, which forces the real duration to be computed.
-      if (Number.isFinite(media.duration) && media.duration > 0) {
-        finalize(media.duration);
-        return;
-      }
-      const onSeeked = () => {
-        media.removeEventListener('timeupdate', onSeeked);
-        media.currentTime = 0;
-        finalize(media.duration);
-      };
-      media.addEventListener('timeupdate', onSeeked);
-      media.currentTime = Number.MAX_SAFE_INTEGER;
+  }
+
+  const media = document.createElement(kind === 'video' ? 'video' : 'audio');
+  media.preload = 'metadata';
+  media.src = objectUrl;
+  const browserMetadata = await new Promise<Pick<AssetRecord, 'duration' | 'width' | 'height'>>((resolve) => {
+    let complete = false;
+    const finish = () => {
+      if (complete) return;
+      complete = true;
+      window.clearTimeout(timeout);
+      const duration = Number.isFinite(media.duration) && media.duration > 0 ? media.duration : undefined;
+      resolve({
+        duration,
+        width: kind === 'video' ? (media as HTMLVideoElement).videoWidth || undefined : undefined,
+        height: kind === 'video' ? (media as HTMLVideoElement).videoHeight || undefined : undefined
+      });
     };
-    media.onerror = () => resolve({});
-    media.src = objectUrl;
+    const timeout = window.setTimeout(finish, 2500);
+    media.onloadedmetadata = finish;
+    media.onerror = finish;
+    media.load();
   });
+  media.removeAttribute('src');
+  media.load();
+
+  // Use the primary track duration, not the container duration. Audio commonly extends
+  // a few milliseconds past the last video frame and would otherwise create a black tail.
+  try {
+    const [{ ALL_FORMATS, BlobSource, Input }, blob] = await Promise.all([
+      import('mediabunny'),
+      fetch(objectUrl).then((response) => response.blob())
+    ]);
+    const input = new Input({ source: new BlobSource(blob), formats: ALL_FORMATS });
+    try {
+      const track = kind === 'video' ? await input.getPrimaryVideoTrack() : await input.getPrimaryAudioTrack();
+      let duration = track ? await track.getDurationFromMetadata({ skipLiveWait: true }) : null;
+      if ((!duration || !Number.isFinite(duration)) && track) duration = await track.computeDuration({ skipLiveWait: true });
+      if (!duration || !Number.isFinite(duration)) duration = browserMetadata.duration ?? null;
+      return { ...browserMetadata, duration: duration && Number.isFinite(duration) ? duration : undefined };
+    } finally {
+      input.dispose();
+    }
+  } catch {
+    return browserMetadata;
+  }
 }
 
 function blobToDataUrl(blob: Blob): Promise<string> {
@@ -250,7 +267,11 @@ async function captureVideoThumbnails(objectUrl: string, count = 5, onFrame?: (i
   // Capture the poster frame (index 0) first and hand it back immediately so the UI can
   // show a preview without waiting for the whole strip to finish seeking.
   for (let index = 0; index < count; index += 1) {
-    const time = duration > 0 ? Math.min(duration - 0.01, (duration * (index + 0.5)) / count) : 0;
+    const time = index === 0
+      ? 0
+      : duration > 0
+        ? Math.min(duration - 0.01, (duration * index) / Math.max(1, count - 1))
+        : 0;
     await new Promise<void>((resolve) => {
       let complete = false;
       const finish = () => {
@@ -348,11 +369,27 @@ function projectFirstFrameAsset(project: ProjectRecord): AssetRecord | undefined
   );
   if (!visualClips.length) return undefined;
   const atStart = visualClips
-    .filter((clip) => clip.start <= 0.001)
+    .filter((clip) => clip.start <= 0 && clip.start + clip.duration > 0)
     .sort((a, b) => trackOrder(a) - trackOrder(b));
-  const chosen = atStart[0]
-    ?? visualClips.slice().sort((a, b) => a.start - b.start || trackOrder(a) - trackOrder(b))[0];
+  const chosen = atStart[0];
   return chosen?.assetId ? project.assets.find((asset) => asset.id === chosen.assetId && !asset.trashedAt) : undefined;
+}
+
+function projectPreviewSignature(project: ProjectRecord): string {
+  const clips = project.timeline
+    .filter((clip) => (clip.type === 'video' || clip.type === 'image' || clip.type === 'text')
+      && clip.start <= 0
+      && clip.start + clip.duration > 0
+      && !project.tracks.find((track) => track.id === clip.trackId)?.hidden)
+    .map((clip) => {
+      const asset = clip.assetId ? project.assets.find((item) => item.id === clip.assetId) : undefined;
+      return {
+        ...clip,
+        asset: asset ? { id: asset.id, driveFileId: asset.driveFileId, name: asset.name, size: asset.size, duration: asset.duration } : undefined
+      };
+    });
+  if (!clips.length) return '';
+  return JSON.stringify({ width: project.width, height: project.height, fps: project.fps, clips });
 }
 
 function clipMediaLimit(clip: Pick<TimelineItem, 'type' | 'trimStart' | 'playbackRate'>, asset: AssetRecord | undefined): number {
@@ -361,6 +398,36 @@ function clipMediaLimit(clip: Pick<TimelineItem, 'type' | 'trimStart' | 'playbac
   const rate = clip.playbackRate || 1;
   const available = asset.duration - (clip.trimStart || 0);
   return Math.max(0.2, available / rate);
+}
+
+function clampAssetClips(project: ProjectRecord, assetId: string, asset: AssetRecord): TimelineItem[] {
+  const replacements = new Map<string, TimelineItem>();
+  const tolerance = Math.max(0.001, 1 / Math.max(1, project.fps));
+  project.tracks.forEach((track) => {
+    const clips = project.timeline.filter((clip) => clip.trackId === track.id).sort((a, b) => a.start - b.start);
+    let carry = 0;
+    let previousEnd: number | undefined;
+    clips.forEach((clip) => {
+      if (previousEnd !== undefined && Math.abs(clip.start - previousEnd) > tolerance) carry = 0;
+      const limit = clip.assetId === assetId ? clipMediaLimit(clip, asset) : Number.POSITIVE_INFINITY;
+      const duration = Number.isFinite(limit) ? Math.min(clip.duration, limit) : clip.duration;
+      replacements.set(clip.id, {
+        ...clip,
+        start: Math.max(0, clip.start + carry),
+        duration
+      });
+      carry += duration - clip.duration;
+      previousEnd = clip.start + clip.duration;
+    });
+  });
+  return project.timeline.map((clip) => replacements.get(clip.id) || clip);
+}
+
+function durationAfterTimelineCorrection(project: ProjectRecord, timeline: TimelineItem[]): number {
+  const oldEnd = project.timeline.length ? Math.max(...project.timeline.map((clip) => clip.start + clip.duration)) : 0;
+  const nextEnd = timeline.length ? Math.max(...timeline.map((clip) => clip.start + clip.duration)) : 0;
+  const inferredDuration = Math.abs(project.duration - oldEnd) <= Math.max(0.001, 1 / Math.max(1, project.fps));
+  return inferredDuration ? Math.max(1, nextEnd) : project.duration;
 }
 
 function compactTimelineTracks(timeline: TimelineItem[], trackIds: Set<string>): TimelineItem[] {
@@ -433,6 +500,7 @@ export function App() {
   const assetThumbnailPromisesRef = useRef(new Map<string, Promise<boolean>>());
   const homeThumbnailJobRef = useRef<string | undefined>(undefined);
   const homeThumbnailFailuresRef = useRef(new Set<string>());
+  const projectPreviewJobRef = useRef<string | undefined>(undefined);
   // Cached timeline filmstrip frames (assetId -> frames) for the open project. Persisted
   // to a per-project previews.json on Drive so they don't get regenerated from the media
   // every session.
@@ -452,15 +520,14 @@ export function App() {
     if (activeProjectId || !profile || !drive.accessToken || homeThumbnailJobRef.current) return;
     const target = projects.map((project) => {
       const visual = project.assets.filter((asset) => !asset.trashedAt && asset.driveFileId && (asset.kind === 'video' || asset.kind === 'image'));
-      // If any visual asset already has a thumbnail the card can render — nothing to do.
-      if (!visual.length || visual.some((asset) => asset.thumbnailDataUrl)) return undefined;
-      // Try the first frame first, then fall back to the project's other visual assets so
-      // the card still gets a preview if that exact frame can't be thumbnailed.
+      if (!visual.length) return undefined;
+      // Load only the asset visible at time zero; unrelated files must not become the
+      // project's home preview.
       const firstFrame = projectFirstFrameAsset(project);
-      const ordered = firstFrame && visual.includes(firstFrame)
-        ? [firstFrame, ...visual.filter((asset) => asset !== firstFrame)]
-        : visual;
-      const asset = ordered.find((item) => !homeThumbnailFailuresRef.current.has(`${project.id}:${item.id}`));
+      const asset = firstFrame && visual.includes(firstFrame) && !firstFrame.thumbnailDataUrl
+        && !homeThumbnailFailuresRef.current.has(`${project.id}:${firstFrame.id}`)
+        ? firstFrame
+        : undefined;
       return asset ? { project, asset } : undefined;
     }).find((entry): entry is { project: ProjectRecord; asset: AssetRecord } => !!entry);
     if (!target) return;
@@ -473,10 +540,8 @@ export function App() {
           homeThumbnailFailuresRef.current.add(jobKey);
           return;
         }
-        const isFirstFrame = projectFirstFrameAsset(target.project)?.id === target.asset.id;
         const updatedProject = {
           ...target.project,
-          previewDataUrl: isFirstFrame ? thumbnailDataUrl : target.project.previewDataUrl,
           assets: target.project.assets.map((asset) => asset.id === target.asset.id ? { ...asset, thumbnailDataUrl } : asset)
         };
         setProjects((current) => {
@@ -649,19 +714,34 @@ export function App() {
     return () => { cancelled = true; };
   }, [activeProjectId, drive]);
 
-  // Keep the project's preview as the frame of its first clip. The first-frame asset is
-  // loaded for playback while editing, so its poster is generated for free — we just copy
-  // it onto the project so the home card shows the real first frame, not a random asset.
+  // Render the actual composition at time zero, including trims, transforms and layers.
   useEffect(() => {
     const project = activeProject;
     if (!project) return;
-    const first = projectFirstFrameAsset(project);
-    if (!first) return;
-    const frame = first.thumbnailDataUrl || (first.kind === 'video' ? videoFrames[first.id]?.[0] : undefined);
-    if (frame && project.previewDataUrl !== frame) {
-      patchActiveProject((current) => ({ ...current, previewDataUrl: frame }), false);
+    const signature = projectPreviewSignature(project);
+    if (!signature) {
+      if (project.previewDataUrl || project.previewSignature) {
+        patchActiveProject((current) => ({ ...current, previewDataUrl: undefined, previewSignature: undefined }), false);
+      }
+      return;
     }
-  }, [activeProject, videoFrames, patchActiveProject]);
+    if (project.previewDataUrl && project.previewSignature === signature) return;
+    const media = project.timeline.filter((clip) => (clip.type === 'video' || clip.type === 'image')
+      && clip.start <= 0
+      && clip.start + clip.duration > 0
+      && !project.tracks.find((track) => track.id === clip.trackId)?.hidden);
+    if (media.some((clip) => !project.assets.find((asset) => asset.id === clip.assetId)?.objectUrl)) return;
+    const jobKey = `${project.id}:${signature}`;
+    if (projectPreviewJobRef.current === jobKey) return;
+    projectPreviewJobRef.current = jobKey;
+    void import('./exportVideo').then(({ renderProjectPreview }) => renderProjectPreview(project, 0)).then((frame) => {
+      const current = activeProjectRef.current;
+      if (!frame || !current || current.id !== project.id || projectPreviewSignature(current) !== signature) return;
+      patchActiveProject((value) => ({ ...value, previewDataUrl: frame, previewSignature: signature }), false);
+    }).catch(() => undefined).finally(() => {
+      if (projectPreviewJobRef.current === jobKey) projectPreviewJobRef.current = undefined;
+    });
+  }, [activeProject, patchActiveProject]);
 
   useEffect(() => {
     undoStackRef.current = [];
@@ -833,10 +913,31 @@ export function App() {
     }
   }
 
+  function patchAssetMetadata(assetId: string, metadata: Pick<AssetRecord, 'duration' | 'width' | 'height'>) {
+    patchActiveProject((project) => {
+      const currentAsset = project.assets.find((asset) => asset.id === assetId);
+      if (!currentAsset) return project;
+      const updatedAsset = { ...currentAsset, ...metadata, metadataVersion: 2 };
+      const timeline = clampAssetClips(project, assetId, updatedAsset);
+      return {
+        ...project,
+        assets: project.assets.map((asset) => asset.id === assetId ? updatedAsset : asset),
+        timeline,
+        duration: durationAfterTimelineCorrection(project, timeline)
+      };
+    }, false);
+  }
+
   async function ensureAssetLoaded(assetId: string, quiet = false): Promise<void> {
     const project = activeProjectRef.current;
     const asset = project?.assets.find((item) => item.id === assetId);
-    if (!project || !asset || asset.objectUrl || !asset.driveFileId) return;
+    if (!project || !asset) return;
+    if (asset.objectUrl) {
+      if (asset.kind === 'image' || asset.metadataVersion === 2) return;
+      patchAssetMetadata(assetId, await readAssetMetadata(asset.kind, asset.objectUrl));
+      return;
+    }
+    if (!asset.driveFileId) return;
     const pending = assetLoadPromisesRef.current.get(assetId);
     if (pending) return pending;
     const promise = (async () => {
@@ -851,11 +952,19 @@ export function App() {
           assetBlobCacheRef.current.set(asset.driveFileId!, blob);
         }
         const objectUrl = URL.createObjectURL(blob);
-        const metadata = asset.width || asset.height || asset.duration ? {} : await readAssetMetadata(asset.kind, objectUrl);
-        patchActiveProject((current) => ({
-          ...current,
-          assets: current.assets.map((item) => item.id === assetId ? { ...item, ...metadata, objectUrl, uploadState: 'uploaded' } : item)
-        }), false);
+        const metadata = asset.kind === 'image' || asset.metadataVersion !== 2
+          ? await readAssetMetadata(asset.kind, objectUrl)
+          : {};
+        patchActiveProject((current) => {
+          const updatedAsset = { ...asset, ...metadata, metadataVersion: 2, objectUrl, uploadState: 'uploaded' as const };
+          const timeline = clampAssetClips(current, assetId, updatedAsset);
+          return {
+            ...current,
+            assets: current.assets.map((item) => item.id === assetId ? { ...item, ...metadata, metadataVersion: 2, objectUrl, uploadState: 'uploaded' } : item),
+            timeline,
+            duration: durationAfterTimelineCorrection(current, timeline)
+          };
+        }, false);
       } catch (error) {
         patchActiveProject((current) => ({
           ...current,
@@ -1095,10 +1204,7 @@ export function App() {
         assets: [asset, ...project.assets]
       }));
       void readAssetMetadata(kind, objectUrl).then((metadata) => {
-        patchActiveProject((project) => ({
-          ...project,
-          assets: project.assets.map((entry) => entry.id === asset.id ? { ...entry, ...metadata } : entry)
-        }), false);
+        patchAssetMetadata(asset.id, metadata);
       });
       if (kind === 'image') {
         void captureImageThumbnail(objectUrl).then((thumbnailDataUrl) => setAssetThumbnail(asset.id, thumbnailDataUrl)).catch(() => undefined);
@@ -1131,23 +1237,34 @@ export function App() {
 
   async function placeAssetOnTimeline(assetId: string, start: number, requestedTrackId?: string) {
     const clipId = uid('clip');
-    // Make sure we know the real media length before placing, otherwise the clip would
-    // fall back to a placeholder duration and not appear at its full length.
-    const pending = activeProject?.assets.find((item) => item.id === assetId && !item.trashedAt);
-    if (pending && (pending.kind === 'video' || pending.kind === 'audio') && (!pending.duration || !Number.isFinite(pending.duration)) && pending.objectUrl) {
-      const metadata = await readAssetMetadata(pending.kind, pending.objectUrl);
-      if (metadata.duration || metadata.width || metadata.height) {
-        patchActiveProject((project) => ({
-          ...project,
-          assets: project.assets.map((entry) => entry.id === assetId ? { ...entry, ...metadata } : entry)
-        }), false);
-      }
+    try {
+      await ensureAssetLoaded(assetId, true);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'No se pudo preparar el archivo.');
+      return;
     }
+    let preparedAsset = activeProjectRef.current?.assets.find((item) => item.id === assetId && !item.trashedAt);
+    if (!preparedAsset) return;
+    if ((preparedAsset.kind === 'video' || preparedAsset.kind === 'audio') && (!preparedAsset.duration || !Number.isFinite(preparedAsset.duration))) {
+      if (!preparedAsset.objectUrl) {
+        setToast('No se pudo cargar el archivo para leer su duracion.');
+        return;
+      }
+      const metadata = await readAssetMetadata(preparedAsset.kind, preparedAsset.objectUrl);
+      if (!metadata.duration) {
+        setToast(`No se pudo determinar la duracion real de ${preparedAsset.name}.`);
+        return;
+      }
+      patchAssetMetadata(assetId, metadata);
+      preparedAsset = { ...preparedAsset, ...metadata };
+    }
+    const preparedDuration = preparedAsset.kind === 'image' ? 5 : preparedAsset.duration;
+    if (!preparedDuration || !Number.isFinite(preparedDuration)) return;
     patchActiveProject((project) => {
       const asset = project.assets.find((item) => item.id === assetId && !item.trashedAt);
       if (!asset) return project;
       const trackKind = asset.kind === 'audio' ? 'audio' : 'video';
-      const duration = asset.kind === 'image' ? 5 : clamp(asset.duration || 6, 0.2, 60 * 60);
+      const duration = Math.max(0.2, preparedDuration);
       const safeStart = clamp(start, 0, Math.max(project.duration, start));
       let track = project.tracks.find((item) => item.id === requestedTrackId && item.kind === trackKind);
       const overlaps = (trackId: string) => project.timeline.some((clip) => clip.trackId === trackId && timelineItemsOverlap(safeStart, duration, clip));
@@ -1364,9 +1481,13 @@ export function App() {
         if (siblings.some((clip) => timelineItemsOverlap(updated.start, updated.duration, clip))) updated = current;
       }
       // Never let a video/audio clip extend past the end of its source media.
-      const mediaLimit = clipMediaLimit(updated, updated.assetId ? project.assets.find((asset) => asset.id === updated.assetId) : undefined);
+      const mediaAsset = updated.assetId ? project.assets.find((asset) => asset.id === updated.assetId) : undefined;
+      const mediaLimit = clipMediaLimit(updated, mediaAsset);
       if (Number.isFinite(mediaLimit) && updated.duration > mediaLimit) {
         updated = { ...updated, duration: Math.max(0.2, mediaLimit) };
+      } else if ((updated.type === 'video' || updated.type === 'audio') && !Number.isFinite(mediaLimit) && updated.duration > current.duration) {
+        // Unknown source length is not permission to create an infinite black tail.
+        updated = { ...updated, duration: current.duration };
       }
       let timeline = project.timeline.map((clip) => clip.id === clipId ? updated : clip);
       if (ripple && (patch.start !== undefined || patch.duration !== undefined || patch.playbackRate !== undefined)) {
@@ -1412,7 +1533,7 @@ export function App() {
             id: uid('clip'),
             start: time,
             duration: secondDuration,
-            trimStart: (clip.trimStart || 0) + firstDuration
+            trimStart: (clip.trimStart || 0) + firstDuration * (clip.playbackRate || 1)
           }
         ];
       });
@@ -1876,7 +1997,7 @@ function ProjectCard(props: {
   // Always the project's first frame: the dedicated project preview (captured from the
   // first clip) or, failing that, the first-frame asset's own thumbnail. Never a random
   // asset from the bin.
-  const previewSource = props.project.previewDataUrl
+  const previewSource = (props.project.previewSignature ? props.project.previewDataUrl : undefined)
     || firstFrameAsset?.thumbnailDataUrl
     || (firstFrameAsset?.kind === 'image' ? firstFrameAsset.objectUrl : undefined);
   // Show the loading shimmer only while previews are genuinely still being prepared (no
@@ -2600,7 +2721,6 @@ function EditorView(props: {
   const cancelProjectTitleEditRef = useRef(false);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const audioRefs = useRef(new Map<string, HTMLAudioElement>());
-  const preloadRefs = useRef(new Map<string, HTMLVideoElement>());
   const clipboardClipsRef = useRef<TimelineItem[]>([]);
   const thumbnailJobRef = useRef<string | undefined>(undefined);
   const thumbnailFailuresRef = useRef(new Set<string>());
@@ -2662,6 +2782,7 @@ function EditorView(props: {
     originStart: number;
     originDuration: number;
     originTrimStart: number;
+    isMedia: boolean;
     mediaDuration?: number;
     playbackRate: number;
   } | null>(null);
@@ -2681,10 +2802,13 @@ function EditorView(props: {
   const upcomingVisualClips = props.project.timeline.filter((clip) =>
     clip.type === 'video'
     && clip.start > playhead
-    && clip.start - playhead <= 0.75
+    && clip.start - playhead <= (playing ? 30 : 1.5)
     && !activeVisualClips.some((active) => active.id === clip.id)
     && !props.project.tracks.find((track) => track.id === clip.trackId)?.hidden
-  );
+  ).sort((a, b) => a.start - b.start).slice(0, 2);
+  const preparedVisualClips = [...activeVisualClips, ...upcomingVisualClips]
+    .filter((clip, index, clips) => clips.findIndex((candidate) => candidate.id === clip.id) === index)
+    .sort((a, b) => props.project.tracks.findIndex((track) => track.id === b.trackId) - props.project.tracks.findIndex((track) => track.id === a.trackId));
   const activeAudioAsset = activeAudioClips[0]?.assetId ? props.project.assets.find((asset) => asset.id === activeAudioClips[0].assetId) : undefined;
   const timelineMediaEnd = props.project.timeline.length
     ? Math.max(...props.project.timeline.map((clip) => clip.start + clip.duration))
@@ -2761,12 +2885,27 @@ function EditorView(props: {
   useEffect(() => {
     const required = new Set([
       ...activeVisualClips.map((clip) => clip.assetId),
+      ...upcomingVisualClips.map((clip) => clip.assetId),
       ...activeAudioClips.map((clip) => clip.assetId),
       selectedClip?.assetId,
       selectedAssetId
     ].filter((id): id is string => !!id));
     required.forEach((assetId) => { void props.onEnsureAssetLoaded(assetId, true).catch(() => undefined); });
   }, [playhead, selectedClip?.assetId, selectedAssetId, props.project.id]);
+
+  useEffect(() => {
+    const source = timelineDragSourceRef.current;
+    if (!source || source.source !== 'asset') return;
+    const asset = props.project.assets.find((item) => item.id === source.id);
+    const duration = asset?.kind === 'image' ? 5 : asset?.duration;
+    if (!duration || !Number.isFinite(duration) || Math.abs(duration - source.duration) < 0.001) return;
+    source.duration = duration;
+    const preview = timelineDragPreviewRef.current;
+    if (!preview || preview.source !== 'asset' || preview.id !== source.id) return;
+    const next = { ...preview, duration };
+    timelineDragPreviewRef.current = next;
+    setTimelineDragPreview(next);
+  }, [props.project.assets]);
 
   useEffect(() => () => { editorMountedRef.current = false; }, []);
 
@@ -2923,7 +3062,7 @@ function EditorView(props: {
   // Decode the first frame of clips that are about to start so they appear instantly.
   useEffect(() => {
     upcomingVisualClips.forEach((clip) => {
-      const video = preloadRefs.current.get(clip.id);
+      const video = videoRefs.current.get(clip.id);
       if (!video) return;
       const rate = clip.playbackRate || 1;
       const firstFrame = Math.max(0, clip.reverse ? (clip.trimStart || 0) + clip.duration * rate - 1 / props.project.fps : clip.trimStart || 0);
@@ -3185,6 +3324,7 @@ function EditorView(props: {
       originStart: clip.start,
       originDuration: clip.duration,
       originTrimStart: clip.trimStart || 0,
+      isMedia: clip.type === 'video' || clip.type === 'audio',
       mediaDuration: asset?.duration && Number.isFinite(asset.duration) ? asset.duration : undefined,
       playbackRate: clip.playbackRate || 1
     };
@@ -3208,6 +3348,8 @@ function EditorView(props: {
       if (gesture.mediaDuration) {
         const maxEnd = gesture.originStart + (gesture.mediaDuration - gesture.originTrimStart) / gesture.playbackRate;
         end = Math.min(end, maxEnd);
+      } else if (gesture.isMedia) {
+        end = Math.min(end, gesture.originStart + gesture.originDuration);
       }
       props.onUpdateClip(gesture.clipId, { duration: Math.max(0.2, end - gesture.originStart) });
       return;
@@ -3215,12 +3357,14 @@ function EditorView(props: {
     const start = snapValue(gesture.originStart + delta);
     // For media clips the start edge can't move earlier than the source's trim-in point,
     // otherwise we'd expose media that doesn't exist (a frozen/black lead-in frame).
-    const minDelta = gesture.mediaDuration ? Math.max(-gesture.originStart, -gesture.originTrimStart) : -gesture.originStart;
+    const minDelta = gesture.mediaDuration
+      ? Math.max(-gesture.originStart, -gesture.originTrimStart / gesture.playbackRate)
+      : gesture.isMedia ? 0 : -gesture.originStart;
     const appliedDelta = clamp(start - gesture.originStart, minDelta, gesture.originDuration - 0.2);
     props.onUpdateClip(gesture.clipId, {
       start: gesture.originStart + appliedDelta,
       duration: gesture.originDuration - appliedDelta,
-      trimStart: Math.max(0, gesture.originTrimStart + appliedDelta)
+      trimStart: Math.max(0, gesture.originTrimStart + appliedDelta * gesture.playbackRate)
     });
   };
 
@@ -3446,18 +3590,31 @@ function EditorView(props: {
 
   useEffect(() => {
     if (!playing) return;
-    const timer = window.setInterval(() => {
-      setPlayhead((current) => {
-        const next = current + 0.1;
-        if (next >= props.project.duration) {
-          setPlaying(false);
-          return 0;
-        }
-        return next;
-      });
-    }, 100);
-    return () => window.clearInterval(timer);
-  }, [playing, props.project.duration]);
+    let frame = 0;
+    let previous = performance.now();
+    let accumulated = 0;
+    const frameInterval = 1000 / Math.min(30, Math.max(1, props.project.fps));
+    const tick = (now: number) => {
+      const elapsed = Math.max(0, now - previous);
+      previous = now;
+      accumulated += elapsed;
+      if (accumulated >= frameInterval) {
+        const advance = accumulated / 1000;
+        accumulated = 0;
+        setPlayhead((current) => {
+          const next = current + advance;
+          if (next >= props.project.duration) {
+            setPlaying(false);
+            return 0;
+          }
+          return next;
+        });
+      }
+      frame = window.requestAnimationFrame(tick);
+    };
+    frame = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(frame);
+  }, [playing, props.project.duration, props.project.fps]);
 
   return (
     <main
@@ -3607,7 +3764,7 @@ function EditorView(props: {
                   draggable={!showAssetBin}
                   onDragStart={(event) => {
                     void props.onEnsureAssetLoaded(asset.id, true).catch(() => undefined);
-                    const duration = asset.kind === 'image' ? 5 : clamp(asset.duration || 6, 0.2, 60 * 60);
+                    const duration = asset.kind === 'image' ? 5 : Math.max(0.2, asset.duration || 6);
                     timelineDragSourceRef.current = { source: 'asset', id: asset.id, kind: asset.kind, duration, grabOffset: 0 };
                     event.dataTransfer.setData('application/x-inhouse-asset', asset.id);
                     event.dataTransfer.effectAllowed = 'copy';
@@ -3681,9 +3838,10 @@ function EditorView(props: {
               onPointerUp={endTransformGesture}
               onPointerCancel={endTransformGesture}
             >
-              {activeVisualClips.map((clip) => {
+              {preparedVisualClips.map((clip) => {
                 const asset = clip.assetId ? props.project.assets.find((item) => item.id === clip.assetId) : undefined;
                 if (!asset?.objectUrl) return null;
+                const isActive = activeVisualClips.some((active) => active.id === clip.id);
                 const projectRatio = props.project.width / props.project.height;
                 const assetRatio = asset.width && asset.height ? asset.width / asset.height : projectRatio;
                 const mediaWidth = clip.transform.fit === 'cover' ? 100 : assetRatio >= projectRatio ? 100 : (assetRatio / projectRatio) * 100;
@@ -3698,7 +3856,8 @@ function EditorView(props: {
                 return (
                   <div
                     key={clip.id}
-                    className={`preview-media-layer ${asset.kind} ${selectedClipIds.includes(clip.id) ? 'selected' : ''}`}
+                    className={`preview-media-layer ${asset.kind} ${isActive && selectedClipIds.includes(clip.id) ? 'selected' : ''}`}
+                    aria-hidden={!isActive}
                     style={{
                       width: `${mediaWidth}%`,
                       height: `${mediaHeight}%`,
@@ -3706,17 +3865,18 @@ function EditorView(props: {
                       top: `${50 + clip.transform.y}%`,
                       zIndex: props.project.tracks.length - trackIndex,
                       transform: `translate(-50%, -50%) scale(${clip.transform.scale}) rotate(${clip.transform.rotation}deg)`,
-                      opacity: (clip.transform.opacity / 100) * transitionOpacity,
+                      opacity: isActive ? (clip.transform.opacity / 100) * transitionOpacity : 0,
+                      pointerEvents: isActive ? 'auto' : 'none',
                       clipPath: `inset(${clip.transform.cropY}% ${cropRight}% ${cropBottom}% ${clip.transform.cropX}%)`
                     }}
                     onPointerDown={(event) => beginTransform(event, clip, 'move')}
                   >
                     {asset.kind === 'video' ? (
-                      <video ref={(node) => { if (node) videoRefs.current.set(clip.id, node); else videoRefs.current.delete(clip.id); }} src={asset.objectUrl} playsInline controls={false} draggable={false} preload="auto" style={{ objectFit: clip.transform.fit, transform: `scaleX(${clip.transform.flipX ? -1 : 1}) scaleY(${clip.transform.flipY ? -1 : 1})` }} />
+                      <video ref={(node) => { if (node) videoRefs.current.set(clip.id, node); else videoRefs.current.delete(clip.id); }} src={asset.objectUrl} poster={asset.thumbnailDataUrl} playsInline controls={false} draggable={false} preload="auto" style={{ objectFit: clip.transform.fit, transform: `scaleX(${clip.transform.flipX ? -1 : 1}) scaleY(${clip.transform.flipY ? -1 : 1})` }} />
                     ) : (
                       <img src={asset.objectUrl} alt="" draggable={false} style={{ objectFit: clip.transform.fit, transform: `scaleX(${clip.transform.flipX ? -1 : 1}) scaleY(${clip.transform.flipY ? -1 : 1})` }} />
                     )}
-                    {selectedClipId === clip.id ? (
+                    {isActive && selectedClipId === clip.id ? (
                       <button
                         className="transform-handle"
                         aria-label="Cambiar tamano"
@@ -3725,24 +3885,6 @@ function EditorView(props: {
                       />
                     ) : null}
                   </div>
-                );
-              })}
-              {upcomingVisualClips.map((clip) => {
-                const asset = clip.assetId ? props.project.assets.find((item) => item.id === clip.assetId) : undefined;
-                if (!asset?.objectUrl) return null;
-                return (
-                  <video
-                    key={`preload-${clip.id}`}
-                    ref={(node) => { if (node) preloadRefs.current.set(clip.id, node); else preloadRefs.current.delete(clip.id); }}
-                    src={asset.objectUrl}
-                    muted
-                    playsInline
-                    controls={false}
-                    draggable={false}
-                    preload="auto"
-                    aria-hidden="true"
-                    style={{ position: 'absolute', width: 2, height: 2, opacity: 0, pointerEvents: 'none', left: 0, top: 0 }}
-                  />
                 );
               })}
               {!activeVisualClips.length && activeAudioAsset?.objectUrl ? (

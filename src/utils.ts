@@ -101,17 +101,29 @@ export function sanitizeProjectName(value: string): string {
 
 export function normalizeLoadedProject(raw: Partial<ProjectRecord>): ProjectRecord {
   const fallback = createEmptyProject(raw.name || 'nuevo video');
+  const assets = Array.isArray(raw.assets) ? raw.assets : [];
   const tracks = Array.isArray(raw.tracks) && raw.tracks.length
     ? raw.tracks.map((track) => ({ ...track, hidden: !!track.hidden }))
     : createDefaultTracks();
-  const timeline: TimelineItem[] = Array.isArray(raw.timeline) ? raw.timeline.map((clip): TimelineItem => ({
-    ...clip,
-    transform: { ...defaultTransform(), ...(clip.transform || {}) },
-    textStyle: clip.type === 'text' ? { ...defaultTextStyle(), ...(clip.textStyle || {}) } : clip.textStyle,
-    transition: { type: 'none' as const, duration: 0.5, ...(clip.transition || {}) },
-    playbackRate: Math.min(8, Math.max(0.1, Number(clip.playbackRate) || 1)),
-    reverse: !!clip.reverse
-  })) : [];
+  const timeline: TimelineItem[] = Array.isArray(raw.timeline) ? raw.timeline.map((clip): TimelineItem => {
+    const playbackRate = Math.min(8, Math.max(0.1, Number(clip.playbackRate) || 1));
+    const asset = clip.assetId ? assets.find((item) => item.id === clip.assetId) : undefined;
+    const sourceDuration = Number(asset?.duration);
+    const trimStart = Math.max(0, Number(clip.trimStart) || 0);
+    const sourceLimit = (clip.type === 'video' || clip.type === 'audio') && Number.isFinite(sourceDuration) && sourceDuration > 0
+      ? Math.max(0.2, (sourceDuration - trimStart) / playbackRate)
+      : Number.POSITIVE_INFINITY;
+    return {
+      ...clip,
+      duration: Math.min(Math.max(0.2, Number(clip.duration) || 0.2), sourceLimit),
+      trimStart,
+      transform: { ...defaultTransform(), ...(clip.transform || {}) },
+      textStyle: clip.type === 'text' ? { ...defaultTextStyle(), ...(clip.textStyle || {}) } : clip.textStyle,
+      transition: { type: 'none' as const, duration: 0.5, ...(clip.transition || {}) },
+      playbackRate,
+      reverse: !!clip.reverse
+    };
+  }) : [];
   const assigned = new Map<string, TimelineItem[]>();
   const trackKindForClip = (clip: TimelineItem) => clip.type === 'audio' ? 'audio' : clip.type === 'text' ? 'text' : 'video';
   timeline
@@ -143,7 +155,7 @@ export function normalizeLoadedProject(raw: Partial<ProjectRecord>): ProjectReco
     ...raw,
     id: raw.id || fallback.id,
     name: sanitizeProjectName(raw.name || fallback.name),
-    assets: Array.isArray(raw.assets) ? raw.assets : [],
+    assets,
     assetFolders: Array.isArray(raw.assetFolders) ? raw.assetFolders : [],
     tracks,
     timeline,
