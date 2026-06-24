@@ -1828,6 +1828,7 @@ button {
   position: absolute;
   inset: 0;
   display: grid;
+  place-content: center;
   place-items: center;
   gap: 10px;
   color: rgba(255, 255, 255, 0.72);
