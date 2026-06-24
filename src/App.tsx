@@ -1826,6 +1826,8 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const mirrorFrameRef = useRef<number | null>(null);
+  const mirrorFrameModeRef = useRef<'animation' | 'video'>('animation');
+  const mirrorVideoRef = useRef<HTMLVideoElement | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const recordingStartedAtRef = useRef(0);
   const discardRecordingRef = useRef(false);
@@ -1833,8 +1835,15 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
   const microphones = devices.filter((device) => device.kind === 'audioinput');
 
   const stopMirroredRecordingStream = () => {
-    if (mirrorFrameRef.current !== null) cancelAnimationFrame(mirrorFrameRef.current);
+    if (mirrorFrameRef.current !== null) {
+      if (mirrorFrameModeRef.current === 'video' && mirrorVideoRef.current?.cancelVideoFrameCallback) {
+        mirrorVideoRef.current.cancelVideoFrameCallback(mirrorFrameRef.current);
+      } else {
+        cancelAnimationFrame(mirrorFrameRef.current);
+      }
+    }
     mirrorFrameRef.current = null;
+    mirrorVideoRef.current = null;
     recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
     recordingStreamRef.current = null;
   };
@@ -1852,10 +1861,12 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
         return;
       }
       try {
+        const idealWidth = mode === 'video' ? 1280 : 1920;
+        const idealHeight = mode === 'video' ? 720 : 1080;
         const stream = await navigator.mediaDevices.getUserMedia({
           video: cameraId
-            ? { deviceId: { exact: cameraId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
-            : { facingMode: 'user', width: { ideal: 1920 }, height: { ideal: 1080 } },
+            ? { deviceId: { exact: cameraId }, width: { ideal: idealWidth }, height: { ideal: idealHeight }, frameRate: { ideal: 30, max: 30 } }
+            : { facingMode: 'user', width: { ideal: idealWidth }, height: { ideal: idealHeight }, frameRate: { ideal: 30, max: 30 } },
           audio: mode === 'video' && audioEnabled
             ? (microphoneId ? { deviceId: { exact: microphoneId }, echoCancellation: true, noiseSuppression: true } : { echoCancellation: true, noiseSuppression: true })
             : false
@@ -1864,6 +1875,8 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
           stream.getTracks().forEach((track) => track.stop());
           return;
         }
+        stream.getVideoTracks().forEach((track) => { track.contentHint = 'motion'; });
+        stream.getAudioTracks().forEach((track) => { track.contentHint = 'speech'; });
         streamRef.current = stream;
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
@@ -1898,7 +1911,7 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
 
   useEffect(() => {
     if (!recording) return;
-    const timer = window.setInterval(() => setElapsed((Date.now() - recordingStartedAtRef.current) / 1000), 200);
+    const timer = window.setInterval(() => setElapsed((Date.now() - recordingStartedAtRef.current) / 1000), 500);
     return () => window.clearInterval(timer);
   }, [recording]);
 
@@ -1958,7 +1971,7 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
       setError('La grabacion de video no esta disponible en este navegador.');
       return;
     }
-    const preferredTypes = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
+    const preferredTypes = ['video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4', 'video/webm;codecs=vp9,opus'];
     const mimeType = preferredTypes.find((type) => MediaRecorder.isTypeSupported(type)) || '';
     try {
       let recorderStream = stream;
@@ -1968,25 +1981,43 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
           return;
         }
         const canvas = document.createElement('canvas');
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
+        const outputScale = Math.min(1, 1280 / video.videoWidth, 720 / video.videoHeight);
+        canvas.width = Math.max(2, Math.floor(video.videoWidth * outputScale / 2) * 2);
+        canvas.height = Math.max(2, Math.floor(video.videoHeight * outputScale / 2) * 2);
         const context = canvas.getContext('2d');
         if (!context) throw new Error('No se pudo preparar el video reflejado.');
         const drawFrame = () => {
           context.setTransform(-1, 0, 0, 1, canvas.width, 0);
           context.drawImage(video, 0, 0, canvas.width, canvas.height);
-          mirrorFrameRef.current = requestAnimationFrame(drawFrame);
+          if (video.requestVideoFrameCallback) {
+            mirrorFrameModeRef.current = 'video';
+            mirrorFrameRef.current = video.requestVideoFrameCallback(drawFrame);
+          } else {
+            mirrorFrameModeRef.current = 'animation';
+            mirrorFrameRef.current = requestAnimationFrame(drawFrame);
+          }
         };
         drawFrame();
-        const frameRate = Math.max(1, Math.min(60, stream.getVideoTracks()[0]?.getSettings().frameRate || 30));
+        const frameRate = Math.max(1, Math.min(30, stream.getVideoTracks()[0]?.getSettings().frameRate || 30));
         const mirroredStream = canvas.captureStream(frameRate);
-        stream.getAudioTracks().forEach((track) => mirroredStream.addTrack(track.clone()));
+        mirroredStream.getVideoTracks().forEach((track) => { track.contentHint = 'motion'; });
+        stream.getAudioTracks().forEach((track) => {
+          const clone = track.clone();
+          clone.contentHint = 'speech';
+          mirroredStream.addTrack(clone);
+        });
         recordingStreamRef.current = mirroredStream;
         recorderStream = mirroredStream;
       }
       chunksRef.current = [];
       discardRecordingRef.current = false;
-      const recorder = new MediaRecorder(recorderStream, mimeType ? { mimeType } : undefined);
+      const recordingSettings = recorderStream.getVideoTracks()[0]?.getSettings();
+      const recordingPixels = (recordingSettings?.width || 1280) * (recordingSettings?.height || 720);
+      const recorder = new MediaRecorder(recorderStream, {
+        ...(mimeType ? { mimeType } : {}),
+        videoBitsPerSecond: recordingPixels > 1_200_000 ? 4_500_000 : recordingPixels > 500_000 ? 2_800_000 : 1_800_000,
+        audioBitsPerSecond: 128_000
+      });
       recorderRef.current = recorder;
       recorder.ondataavailable = (event) => { if (event.data.size) chunksRef.current.push(event.data); };
       recorder.onerror = () => {
@@ -2011,7 +2042,7 @@ function CameraCaptureModal(props: { onClose(): void; onCapture(file: File): voi
       recordingStartedAtRef.current = Date.now();
       setElapsed(0);
       setRecording(true);
-      recorder.start(250);
+      recorder.start(1000);
     } catch {
       stopMirroredRecordingStream();
       setError('No se pudo comenzar la grabacion.');
